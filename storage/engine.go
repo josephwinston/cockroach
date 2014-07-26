@@ -19,8 +19,8 @@ package storage
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/gob"
+	"reflect"
 	"time"
 
 	"github.com/cockroachdb/cockroach/util"
@@ -41,11 +41,25 @@ type Engine interface {
 	scan(start, end Key, max int64) ([]KeyValue, error)
 	// delete removes the item from the db with the given key.
 	del(key Key) error
-	// writeBatch atomically applies the specified writes and deletions.
-	writeBatch(puts []KeyValue, deletes []Key) error
+	// writeBatch atomically applies the specified writes, deletions and
+	// merges. The list passed to writeBatch must only contain elements
+	// of type Batch{Put,Merge,Delete}.
+	writeBatch([]interface{}) error
+	// merge implements a merge operation with counter semantics.
+	// See the docs for goMergeInit and goMerge for details.
+	merge(key Key, value Value) error
 	// capacity returns capacity details for the engine's available storage.
 	capacity() (StoreCapacity, error)
 }
+
+// A BatchDelete is a delete operation executed as part of an atomic batch.
+type BatchDelete Key
+
+// A BatchPut is a put operation executed as part of an atomic batch.
+type BatchPut KeyValue
+
+// A BatchMerge is a merge operation executed as part of an atomic batch.
+type BatchMerge KeyValue
 
 // putI sets the given key to the gob-serialized byte string of the
 // value provided. Used internally. Uses current time and default
@@ -94,24 +108,26 @@ func increment(engine Engine, key Key, inc int64, ts int64) (int64, error) {
 	var int64Val int64
 	// If the value exists, attempt to decode it as a varint.
 	if len(val.Bytes) != 0 {
-		var numBytes int
-		int64Val, numBytes = binary.Varint(val.Bytes)
-		if numBytes == 0 {
-			return 0, util.Errorf("key %q cannot be incremented; not varint-encoded", key)
-		} else if numBytes < 0 {
-			return 0, util.Errorf("key %q cannot be incremented; integer overflow", key)
+		decoded, err := util.Decode(key, val.Bytes)
+		if err != nil {
+			return 0, err
 		}
+		if _, ok := decoded.(int64); !ok {
+			return 0, util.Errorf("received value of wrong type %v", reflect.TypeOf(decoded))
+		}
+		int64Val = decoded.(int64)
 	}
 
 	// Check for overflow and underflow.
-	r := int64Val + inc
-	if (r < int64Val) != (inc < 0) {
+	if util.WillOverflow(int64Val, inc) {
 		return 0, util.Errorf("key %q with value %d incremented by %d results in overflow", key, int64Val, inc)
 	}
 
-	encoded := make([]byte, binary.MaxVarintLen64)
-	numBytes := binary.PutVarint(encoded, r)
-	encoded = encoded[:numBytes]
+	r := int64Val + inc
+	encoded, err := util.Encode(key, r)
+	if err != nil {
+		return 0, util.Errorf("error encoding %d", r)
+	}
 	if err = engine.put(key, Value{Bytes: encoded, Timestamp: ts}); err != nil {
 		return 0, err
 	}

@@ -18,6 +18,7 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"sync"
@@ -27,32 +28,30 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 )
 
-// Constants for store-reserved keys. These keys are prefixed with
-// three null characters so that they precede all global keys in the
-// store's map. Data at these keys is local to this store and is not
-// replicated via raft nor is it available via access to the global
-// key-value store.
-var (
-	// keyStoreIdent store immutable identifier for this store, created
-	// when store is first bootstrapped.
-	keyStoreIdent = Key("\x00\x00\x00store-ident")
-	// keyRangeIDGenerator is a range ID generator sequence. Range IDs
-	// must be unique per node ID.
-	keyRangeIDGenerator = Key("\x00\x00\x00range-id-generator")
-	// keyRangeMetadataPrefix is the prefix for keys storing range metadata.
-	// The value is a struct of type RangeMetadata.
-	keyRangeMetadataPrefix = Key("\x00\x00\x00range-")
-)
-
-// rangeKey creates a range key as the concatenation of the
 // rangeMetadataKeyPrefix and hexadecimal-formatted range ID.
-func rangeKey(rangeID int64) Key {
-	return MakeKey(keyRangeMetadataPrefix, Key(strconv.FormatInt(rangeID, 16)))
+func makeRangeKey(rangeID int64) Key {
+	return MakeKey(KeyLocalRangeMetadataPrefix, Key(strconv.FormatInt(rangeID, 10)))
+}
+
+// A RangeSlice is a slice of Range pointers used for replica lookups
+// by key.
+type RangeSlice []*Range
+
+// Implementation of sort.Interface which sorts by StartKey from each
+// range's metadata.
+func (rs RangeSlice) Len() int {
+	return len(rs)
+}
+func (rs RangeSlice) Swap(i, j int) {
+	rs[i], rs[j] = rs[j], rs[i]
+}
+func (rs RangeSlice) Less(i, j int) bool {
+	return bytes.Compare(rs[i].Meta.StartKey, rs[j].Meta.StartKey) < 0
 }
 
 // A StoreIdent uniquely identifies a store in the cluster. The
 // StoreIdent is written to the underlying storage engine at a
-// store-reserved system key (keyStoreIdent).
+// store-reserved system key (KeyLocalIdent).
 type StoreIdent struct {
 	ClusterID string
 	NodeID    int32
@@ -63,11 +62,12 @@ type StoreIdent struct {
 // to one physical device.
 type Store struct {
 	Ident     StoreIdent
-	engine    Engine           // The underlying key-value store
-	allocator *allocator       // Makes allocation decisions
-	gossip    *gossip.Gossip   // Passed to new ranges
-	mu        sync.Mutex       // Protects the ranges map
-	ranges    map[int64]*Range // Map of ranges by range ID
+	engine    Engine         // The underlying key-value store
+	allocator *allocator     // Makes allocation decisions
+	gossip    *gossip.Gossip // Passed to new ranges
+
+	mu     sync.RWMutex     // Protects ranges map
+	ranges map[int64]*Range // Map of ranges by range ID
 }
 
 // NewStore returns a new instance of a store.
@@ -82,6 +82,8 @@ func NewStore(engine Engine, gossip *gossip.Gossip) *Store {
 
 // Close calls Range.Stop() on all active ranges.
 func (s *Store) Close() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, rng := range s.ranges {
 		rng.Stop()
 	}
@@ -96,7 +98,7 @@ func (s *Store) String() string {
 // bootstrapped. If the store ident is corrupt, IsBootstrapped will
 // return true; the exact error can be retrieved via a call to Init().
 func (s *Store) IsBootstrapped() bool {
-	ok, _, err := getI(s.engine, keyStoreIdent, &s.Ident)
+	ok, _, err := getI(s.engine, KeyLocalIdent, &s.Ident)
 	if err != nil || ok {
 		return true
 	}
@@ -105,7 +107,7 @@ func (s *Store) IsBootstrapped() bool {
 
 // Init reads the StoreIdent from the underlying engine.
 func (s *Store) Init() error {
-	ok, _, err := getI(s.engine, keyStoreIdent, &s.Ident)
+	ok, _, err := getI(s.engine, KeyLocalIdent, &s.Ident)
 	if err != nil {
 		return err
 	} else if !ok {
@@ -113,17 +115,19 @@ func (s *Store) Init() error {
 	}
 
 	// TODO(spencer): scan through all range metadata and instantiate
-	//   ranges. Right now we just get range id hardcoded as 1.
+	//   ranges. Right now we just get range ID hardcoded as 1.
 	var meta RangeMetadata
-	ok, _, err = getI(s.engine, rangeKey(1), &meta)
+	ok, _, err = getI(s.engine, makeRangeKey(1), &meta)
 	if err != nil || !ok {
 		return err
 	}
 
 	rng := NewRange(meta, s.engine, s.allocator, s.gossip)
 	rng.Start()
-	s.ranges[meta.RangeID] = rng
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ranges[meta.RangeID] = rng
 	return nil
 }
 
@@ -140,26 +144,42 @@ func (s *Store) Bootstrap(ident StoreIdent) error {
 	} else if len(kvs) > 0 {
 		return util.Errorf("bootstrap failed; non-empty map with first key %q", kvs[0].Key)
 	}
-	return putI(s.engine, keyStoreIdent, s.Ident)
+	return putI(s.engine, KeyLocalIdent, s.Ident)
 }
 
 // GetRange fetches a range by ID. Returns an error if no range is found.
 func (s *Store) GetRange(rangeID int64) (*Range, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if rng, ok := s.ranges[rangeID]; ok {
 		return rng, nil
 	}
 	return nil, util.Errorf("range %d not found on store", rangeID)
 }
 
+// GetRanges fetches all ranges.
+func (s *Store) GetRanges() RangeSlice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var ranges RangeSlice
+	for _, rng := range s.ranges {
+		ranges = append(ranges, rng)
+	}
+	return ranges
+	// TODO(spencer): any changes to the ranges map will need to also
+	// update the caller of this method. This can probably be done
+	// using a listener for a store's range changes.
+}
+
 // CreateRange allocates a new range ID and stores range metadata.
 // On success, returns the new range.
 func (s *Store) CreateRange(startKey, endKey Key, replicas []Replica) (*Range, error) {
-	rangeID, err := increment(s.engine, keyRangeIDGenerator, 1, time.Now().UnixNano())
+	rangeID, err := increment(s.engine, KeyLocalRangeIDGenerator, 1, time.Now().UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	if ok, _, _ := getI(s.engine, rangeKey(rangeID), nil); ok {
-		return nil, util.Error("newly allocated range id already in use")
+	if ok, _, _ := getI(s.engine, makeRangeKey(rangeID), nil); ok {
+		return nil, util.Error("newly allocated range ID already in use")
 	}
 	// RangeMetadata is stored local to this store only. It is neither
 	// replicated via raft nor available via the global kv store.
@@ -168,17 +188,19 @@ func (s *Store) CreateRange(startKey, endKey Key, replicas []Replica) (*Range, e
 		RangeID:   rangeID,
 		StartKey:  startKey,
 		EndKey:    endKey,
-		Replicas: RangeDescriptor{
+		Desc: RangeDescriptor{
 			StartKey: startKey,
 			Replicas: replicas,
 		},
 	}
-	err = putI(s.engine, rangeKey(rangeID), meta)
+	err = putI(s.engine, makeRangeKey(rangeID), meta)
 	if err != nil {
 		return nil, err
 	}
 	rng := NewRange(meta, s.engine, s.allocator, s.gossip)
 	rng.Start()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.ranges[rangeID] = rng
 	return rng, nil
 }
@@ -207,4 +229,29 @@ func (s *Store) Descriptor(nodeDesc *NodeDescriptor) (*StoreDescriptor, error) {
 		Node:     *nodeDesc,
 		Capacity: capacity,
 	}, nil
+}
+
+// ExecuteCmd fetches a range based on the header's replica, assembles
+// method, args & reply into a Raft Cmd struct and executes the
+// command using the fetched range.
+func (s *Store) ExecuteCmd(method string, header *RequestHeader, args, reply interface{}) error {
+	// Verify specified range contains the command's implicated keys.
+	rng, err := s.GetRange(header.Replica.RangeID)
+	if err != nil {
+		return err
+	}
+	if !rng.ContainsKeyRange(header.Key, header.EndKey) {
+		return util.Errorf("key range %q-%q outside of range bounds %q-%q",
+			string(header.Key), string(header.EndKey), string(rng.Meta.StartKey), string(rng.Meta.EndKey))
+	}
+
+	// Create a Raft command and add it to the per-user command queue.
+	cmd := &Cmd{
+		Method:   method,
+		Args:     args,
+		Reply:    reply,
+		ReadOnly: !NeedWritePerm(method),
+		done:     make(chan error, 1),
+	}
+	return rng.EnqueueCmd(cmd)
 }

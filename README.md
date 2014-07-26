@@ -1,3 +1,5 @@
+<img style="float: right" src="/resources/doc/color_cockroach.png?raw=true"/>
+
 # Cockroach [![Build Status](https://secure.travis-ci.org/cockroachdb/cockroach.png)](http://travis-ci.org/cockroachdb/cockroach)  [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg) 
 
 A Scalable, Geo-Replicated, Transactional Datastore
@@ -20,7 +22,7 @@ A Scalable, Geo-Replicated, Transactional Datastore
 
 ## Next Steps
 
-See [TODO.md](https://github.com/cockroachdb/cockroach/blob/master/TODO.md)
+See [TODO](https://github.com/cockroachdb/cockroach/blob/master/TODO)
 
 ## Get in touch
 
