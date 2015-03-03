@@ -9,33 +9,55 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
+// Author: Bram Gruneir (bram.gruneir@gmail.com)
 
 package server
 
 import (
+	// This is imported for its side-effect of registering expvar
+	// endpoints with the http.DefaultServeMux.
+	_ "expvar"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	// This is imported for its side-effect of registering pprof
+	// endpoints with the http.DefaultServeMux.
+	_ "net/http/pprof"
 	"net/url"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/kv"
+	"github.com/cockroachdb/cockroach/client"
 )
 
 const (
-	// adminKeyPrefix is the prefix for RESTful endpoints used to
+	maxGetResults = 0 // TODO(spencer): maybe we need paged query support
+
+	// adminScheme is the scheme for connecting to the admin endpoint.
+	// TODO(spencer): change this to CONSTANT https. We shouldn't be
+	// supporting http here at all.
+	adminScheme = "http"
+	// adminEndpoint is the prefix for RESTful endpoints used to
 	// provide an administrative interface to the cockroach cluster.
-	adminKeyPrefix = "/_admin/"
-	// zoneKeyPrefix is the prefix for zone configuration changes.
-	zoneKeyPrefix = adminKeyPrefix + "zones"
+	adminEndpoint = "/_admin/"
+	// debugEndpoint is the prefix of golang's standard debug functionality
+	// for access to exported vars and pprof tools.
+	debugEndpoint = "/debug/"
+	// healthzPath is the healthz endpoint.
+	healthzPath = adminEndpoint + "healthz"
+	// acctPathPrefix is the prefix for accounting configuration changes.
+	acctPathPrefix = adminEndpoint + "acct"
+	// permPathPrefix is the prefix for permission configuration changes.
+	permPathPrefix = adminEndpoint + "perms"
+	// zonePathPrefix is the prefix for zone configuration changes.
+	zonePathPrefix = adminEndpoint + "zones"
 )
 
-// A actionHandler is an interface which provides Get, Put & Delete
+// An actionHandler is an interface which provides Get, Put & Delete
 // to satisfy administrative REST APIs.
 type actionHandler interface {
 	Put(path string, body []byte, r *http.Request) error
@@ -46,17 +68,36 @@ type actionHandler interface {
 // A adminServer provides a RESTful HTTP API to administration of
 // the cockroach cluster.
 type adminServer struct {
-	kvDB kv.DB // Key-value database client
+	db   *client.KV // Key-value database client
+	acct *acctHandler
+	perm *permHandler
 	zone *zoneHandler
 }
 
 // newAdminServer allocates and returns a new REST server for
 // administrative APIs.
-func newAdminServer(kvDB kv.DB) *adminServer {
+func newAdminServer(db *client.KV) *adminServer {
 	return &adminServer{
-		kvDB: kvDB,
-		zone: &zoneHandler{kvDB: kvDB},
+		db:   db,
+		acct: &acctHandler{db: db},
+		perm: &permHandler{db: db},
+		zone: &zoneHandler{db: db},
 	}
+}
+
+// RegisterHandlers registers admin handlers with the supplied
+// serve mux.
+func (s *adminServer) RegisterHandlers(mux *http.ServeMux) {
+	// Pass through requests to /debug to the default serve mux so we
+	// get exported variables and pprof tools.
+	mux.HandleFunc(acctPathPrefix, s.handleAcctAction)
+	mux.HandleFunc(acctPathPrefix+"/", s.handleAcctAction)
+	mux.HandleFunc(debugEndpoint, s.handleDebug)
+	mux.HandleFunc(healthzPath, s.handleHealthz)
+	mux.HandleFunc(permPathPrefix, s.handlePermAction)
+	mux.HandleFunc(permPathPrefix+"/", s.handlePermAction)
+	mux.HandleFunc(zonePathPrefix, s.handleZoneAction)
+	mux.HandleFunc(zonePathPrefix+"/", s.handleZoneAction)
 }
 
 // handleHealthz responds to health requests from monitoring services.
@@ -65,15 +106,52 @@ func (s *adminServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// handleDebug passes requests with the debugPathPrefix onto the default
+// serve mux, which is preconfigured (by import of expvar and net/http/pprof)
+// to serve endpoints which access exported variables and pprof tools.
+func (s *adminServer) handleDebug(w http.ResponseWriter, r *http.Request) {
+	handler, _ := http.DefaultServeMux.Handler(r)
+	handler.ServeHTTP(w, r)
+}
+
+// TODO(bram): using a single handler instead of one each for zone/perm/acct
+// handleAcctAction handles actions for accounting configuration by method.
+func (s *adminServer) handleAcctAction(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		s.handleGetAction(s.acct, w, r, acctPathPrefix)
+	case "PUT", "POST":
+		s.handlePutAction(s.acct, w, r, acctPathPrefix)
+	case "DELETE":
+		s.handleDeleteAction(s.acct, w, r, acctPathPrefix)
+	default:
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+	}
+}
+
+// handlePermAction handles actions for perm configuration by method.
+func (s *adminServer) handlePermAction(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		s.handleGetAction(s.perm, w, r, permPathPrefix)
+	case "PUT", "POST":
+		s.handlePutAction(s.perm, w, r, permPathPrefix)
+	case "DELETE":
+		s.handleDeleteAction(s.perm, w, r, permPathPrefix)
+	default:
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+	}
+}
+
 // handleZoneAction handles actions for zone configuration by method.
 func (s *adminServer) handleZoneAction(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		s.handleGetAction(s.zone, w, r)
+		s.handleGetAction(s.zone, w, r, zonePathPrefix)
 	case "PUT", "POST":
-		s.handlePutAction(s.zone, w, r)
+		s.handlePutAction(s.zone, w, r, zonePathPrefix)
 	case "DELETE":
-		s.handleDeleteAction(s.zone, w, r)
+		s.handleDeleteAction(s.zone, w, r, zonePathPrefix)
 	default:
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 	}
@@ -87,8 +165,8 @@ func unescapePath(path, prefix string) (string, error) {
 	return result, nil
 }
 
-func (s *adminServer) handlePutAction(handler actionHandler, w http.ResponseWriter, r *http.Request) {
-	path, err := unescapePath(r.URL.Path, zoneKeyPrefix)
+func (s *adminServer) handlePutAction(handler actionHandler, w http.ResponseWriter, r *http.Request, prefix string) {
+	path, err := unescapePath(r.URL.Path, prefix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -106,8 +184,8 @@ func (s *adminServer) handlePutAction(handler actionHandler, w http.ResponseWrit
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *adminServer) handleGetAction(handler actionHandler, w http.ResponseWriter, r *http.Request) {
-	path, err := unescapePath(r.URL.Path, zoneKeyPrefix)
+func (s *adminServer) handleGetAction(handler actionHandler, w http.ResponseWriter, r *http.Request, prefix string) {
+	path, err := unescapePath(r.URL.Path, prefix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -121,8 +199,8 @@ func (s *adminServer) handleGetAction(handler actionHandler, w http.ResponseWrit
 	fmt.Fprintf(w, "%s", string(b))
 }
 
-func (s *adminServer) handleDeleteAction(handler actionHandler, w http.ResponseWriter, r *http.Request) {
-	path, err := unescapePath(r.URL.Path, zoneKeyPrefix)
+func (s *adminServer) handleDeleteAction(handler actionHandler, w http.ResponseWriter, r *http.Request, prefix string) {
+	path, err := unescapePath(r.URL.Path, prefix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

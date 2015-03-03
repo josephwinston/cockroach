@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -278,7 +278,6 @@ func TestForeignKeys(t *testing.T) {
 func TestBadForeignKeys(t *testing.T) {
 	s, err := createTestSchema()
 	if err != nil {
-
 		t.Fatalf("failed building schema: %s", err)
 	}
 

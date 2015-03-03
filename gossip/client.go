@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -18,13 +18,15 @@
 package gossip
 
 import (
+	"bytes"
 	"encoding/gob"
 	"net"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 const (
@@ -39,6 +41,7 @@ const (
 func init() {
 	gob.Register(&net.TCPAddr{})
 	gob.Register(&net.UnixAddr{})
+	gob.Register(&util.RawAddr{})
 }
 
 // client is a client-side RPC connection to a gossip peer node.
@@ -64,7 +67,7 @@ func newClient(addr net.Addr) *client {
 // channel. If the client experienced an error, its err field will
 // be set. This method blocks and should be invoked via goroutine.
 func (c *client) start(g *Gossip, done chan *client) {
-	c.rpcClient = rpc.NewClient(c.addr, nil)
+	c.rpcClient = rpc.NewClient(c.addr, nil, g.RPCContext)
 	select {
 	case <-c.rpcClient.Ready:
 		// Success!
@@ -106,19 +109,25 @@ func (c *client) gossip(g *Gossip) error {
 		// Compute the delta of local node's infostore to send with request.
 		g.mu.Lock()
 		delta := g.is.delta(c.addr, localMaxSeq)
+		var deltaBytes []byte
 		if delta != nil {
 			localMaxSeq = delta.MaxSeq
+			var buf bytes.Buffer
+			if err := gob.NewEncoder(&buf).Encode(delta); err != nil {
+				return util.Errorf("infostore could not be encoded: %s", err)
+			}
+			deltaBytes = buf.Bytes()
 		}
 		g.mu.Unlock()
 
 		// Send gossip with timeout.
-		args := &GossipRequest{
-			Addr:   g.is.NodeAddr,
-			LAddr:  c.rpcClient.LocalAddr(),
+		args := &proto.GossipRequest{
+			Addr:   *proto.FromNetAddr(g.is.NodeAddr),
+			LAddr:  *proto.FromNetAddr(c.rpcClient.LocalAddr()),
 			MaxSeq: remoteMaxSeq,
-			Delta:  delta,
+			Delta:  deltaBytes,
 		}
-		reply := new(GossipResponse)
+		reply := &proto.GossipResponse{}
 		gossipCall := c.rpcClient.Go("Gossip.Gossip", args, reply, nil)
 		select {
 		case <-gossipCall.Done:
@@ -130,27 +139,34 @@ func (c *client) gossip(g *Gossip) error {
 			return util.Error("client closed")
 		case <-c.closer:
 			return nil
-		case <-time.After(*GossipInterval * 10):
-			return util.Errorf("timeout after: %v", *GossipInterval*10)
+		case <-time.After(g.gossipInterval * 10):
+			return util.Errorf("timeout after: %s", g.gossipInterval*10)
 		}
 
 		// Handle remote forwarding.
 		if reply.Alternate != nil {
-			glog.Infof("received forward from %+v to %+v", c.addr, reply.Alternate)
-			c.forwardAddr = reply.Alternate
+			log.Infof("received forward from %s to %s", c.addr, reply.Alternate)
+			var err error
+			if c.forwardAddr, err = reply.Alternate.NetAddr(); err != nil {
+				return util.Errorf("unable to resolve alternate address: %s: %s", reply.Alternate, err)
+			}
 			return nil
 		}
 
 		// Combine remote node's infostore delta with ours.
 		now := time.Now().UnixNano()
 		if reply.Delta != nil {
-			glog.V(1).Infof("received gossip reply delta from %s: %s", c.addr, reply.Delta)
+			delta := &infoStore{}
+			if err := gob.NewDecoder(bytes.NewBuffer(reply.Delta)).Decode(delta); err != nil {
+				return util.Errorf("infostore could not be decoded: %s", err)
+			}
+			log.V(1).Infof("received gossip reply delta from %s: %s", c.addr, delta)
 			g.mu.Lock()
-			freshCount := g.is.combine(reply.Delta)
+			freshCount := g.is.combine(delta)
 			if freshCount > 0 {
 				c.lastFresh = now
 			}
-			remoteMaxSeq = reply.Delta.MaxSeq
+			remoteMaxSeq = delta.MaxSeq
 
 			// If we have the sentinel gossip, we're considered connected.
 			g.checkHasConnected()

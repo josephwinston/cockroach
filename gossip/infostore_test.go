@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -20,6 +20,8 @@ package gossip
 import (
 	"fmt"
 	"math"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -477,5 +479,88 @@ func TestLeastUseful(t *testing.T) {
 	is.addInfo(inf3)
 	if is.leastUseful(set) != addrs[1] {
 		t.Error("expecting addrs[1] as least useful")
+	}
+}
+
+type callbackRecord struct {
+	keys []string
+	wg   *sync.WaitGroup
+	sync.Mutex
+}
+
+func (cr *callbackRecord) Add(key string, contentsChanged bool) {
+	cr.Lock()
+	defer cr.Unlock()
+	cr.keys = append(cr.keys, fmt.Sprintf("%s-%t", key, contentsChanged))
+	cr.wg.Done()
+}
+
+func (cr *callbackRecord) Keys() []string {
+	cr.Lock()
+	defer cr.Unlock()
+	return append([]string(nil), cr.keys...)
+}
+
+func TestCallbacks(t *testing.T) {
+	is := newInfoStore(emptyAddr)
+	wg := &sync.WaitGroup{}
+	cb1 := callbackRecord{wg: wg}
+	cb2 := callbackRecord{wg: wg}
+	cbAll := callbackRecord{wg: wg}
+
+	is.registerCallback("key1", cb1.Add)
+	is.registerCallback("key2", cb2.Add)
+	is.registerCallback("key.*", cbAll.Add)
+
+	i1 := is.newInfo("key1", float64(1), time.Second)
+	i2 := is.newInfo("key2", float64(1), time.Second)
+	i3 := is.newInfo("key3", float64(1), time.Second)
+
+	// Add infos twice and verify callbacks aren't called for same timestamps.
+	wg.Add(5)
+	for i := 0; i < 2; i++ {
+		is.addInfo(i1)
+		is.addInfo(i2)
+		is.addInfo(i3)
+		wg.Wait()
+
+		if expKeys := []string{"key1-true"}; !reflect.DeepEqual(cb1.Keys(), expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, cb1.Keys())
+		}
+		if expKeys := []string{"key2-true"}; !reflect.DeepEqual(cb2.Keys(), expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, cb2.Keys())
+		}
+		if expKeys := []string{"key1-true", "key2-true", "key3-true"}; !reflect.DeepEqual(cbAll.Keys(), expKeys) {
+			t.Errorf("expected %v, got %v", expKeys, cbAll.Keys())
+		}
+	}
+
+	// Update an info.
+	i1 = is.newInfo("key1", float64(2), time.Second)
+	wg.Add(2)
+	is.addInfo(i1)
+	wg.Wait()
+
+	if expKeys := []string{"key1-true", "key1-true"}; !reflect.DeepEqual(cb1.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cb1.Keys())
+	}
+	if expKeys := []string{"key2-true"}; !reflect.DeepEqual(cb2.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cb2.Keys())
+	}
+	if expKeys := []string{"key1-true", "key2-true", "key3-true", "key1-true"}; !reflect.DeepEqual(cbAll.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cbAll.Keys())
+	}
+
+	// Register another callback with same pattern and verify both the
+	// original and the new are invoked.
+	is.registerCallback("key.*", cbAll.Add)
+	i3 = is.newInfo("key3", float64(1), time.Second)
+	wg.Add(2)
+	is.addInfo(i3)
+	wg.Wait()
+
+	expKeys := []string{"key1-true", "key2-true", "key3-true", "key1-true", "key3-false", "key3-false"}
+	if !reflect.DeepEqual(cbAll.Keys(), expKeys) {
+		t.Errorf("expected %v, got %v", expKeys, cbAll.Keys())
 	}
 }

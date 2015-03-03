@@ -1,29 +1,51 @@
 #!/bin/bash
 
-# Verify arcanist is installed.
-command -v arc &> /dev/null
-if [ $? -eq 1 ]; then
-  cat <<EOF
-Please install Arcanist (part of Phabricator):
+# Bootstrap sets up all needed dependencies.
+# It's idempotent so if you don't hack often, your best bet is to just run this.
+# Assumes you are running from the top of the project.
+#
+# 1) Update all source code and submodules
+# 2) Update go dependencies
+# 3) Build a shadow toolchain containing our dependencies in _vendor/build
 
-  http://www.phabricator.com/docs/phabricator/article/Arcanist_User_Guide.html
-EOF
-  exit 1
+cd -P "$(dirname $0)"
+
+PKGS="github.com/golang/lint/golint"
+PKGS="${PKGS} golang.org/x/tools/cmd/goimports"
+
+# go vet is special: it installs into $GOROOT (which $USER may not have
+# write access to) instead of $GOPATH. It is usually but not always
+# installed along with the rest of the go toolchain. Don't try to
+# install it if it's already there.
+if ! go vet 2>/dev/null; then
+    PKGS="${PKGS} golang.org/x/tools/cmd/vet"
 fi
 
-set -e -x
+set -ex
 
-# Init submodules.
-git submodule init
-git submodule update
+# Update submodules
+git submodule update --init
 
 # Grab binaries required by git hooks.
-go get github.com/golang/lint/golint
-go get code.google.com/p/go.tools/cmd/vet
-go get code.google.com/p/go.tools/cmd/goimports
+go get -u ${PKGS}
+
+# Grab the go dependencies required for building.
+./build/devbase/godeps.sh
+
+go install -v \
+   github.com/cockroachdb/c-protobuf/cmd/protoc \
+   github.com/gogo/protobuf/protoc-gen-gogo
+
+set +x
 
 # Create symlinks to all git hooks in your own .git dir.
 for f in $(ls -d githooks/*); do
   rm .git/hooks/$(basename $f)
   ln -s ../../$f .git/hooks/$(basename $f)
 done && ls -al .git/hooks | grep githooks
+
+cat <<%%%
+****************************************
+Bootstrapped successfully! You don't need to do anything else.
+****************************************
+%%%

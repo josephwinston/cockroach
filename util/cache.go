@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -30,10 +30,12 @@ import (
 // EvictionPolicy is the cache eviction policy enum.
 type EvictionPolicy int
 
-// Constants describing LRU and FIFO cache eviction policies respectively.
+// Constants describing LRU and FIFO, and None cache eviction policies
+// respectively.
 const (
-	CacheLRU EvictionPolicy = iota
-	CacheFIFO
+	CacheLRU  EvictionPolicy = iota // Least recently used
+	CacheFIFO                       // First in, first out
+	CacheNone                       // No evictions; don't maintain ordering list
 )
 
 // A CacheConfig specifies the eviction policy, eviction
@@ -69,6 +71,10 @@ type entry struct {
 	le         *list.Element
 }
 
+func (e entry) String() string {
+	return fmt.Sprintf("%s", e.key)
+}
+
 // Compare implements the llrb.Comparable interface for cache entries.
 // This facility is used by the OrderedCache, and crucially requires
 // that keys used with that cache implement llrb.Comparable.
@@ -80,20 +86,20 @@ func (e *entry) Compare(b llrb.Comparable) int {
 // casting the entry key to an interval key and calling the
 // appropriate accessers.
 func (e *entry) ID() uintptr {
-	return e.key.(*intervalKey).id
+	return e.key.(*IntervalKey).id
 }
 func (e *entry) Start() interval.Comparable {
-	return e.key.(*intervalKey).Start()
+	return e.key.(*IntervalKey).Start()
 }
 func (e *entry) End() interval.Comparable {
-	return e.key.(*intervalKey).End()
+	return e.key.(*IntervalKey).End()
 }
 func (e *entry) NewMutable() interval.Mutable {
-	ik := e.key.(*intervalKey)
-	return &intervalKey{id: 0, start: ik.start, end: ik.end}
+	ik := e.key.(*IntervalKey)
+	return &IntervalKey{id: 0, start: ik.Start(), end: ik.End()}
 }
 func (e *entry) Overlap(r interval.Range) bool {
-	return e.key.(*intervalKey).Overlap(r)
+	return e.key.(*IntervalKey).Overlap(r)
 }
 
 // cacheStore is an interface for the backing store used for the cache.
@@ -106,6 +112,8 @@ type cacheStore interface {
 	del(key interface{})
 	// clear clears all entries.
 	clear()
+	// len is number of items in store.
+	length() int
 }
 
 // baseCache contains the config, cacheStore interface, and the linked
@@ -126,14 +134,14 @@ func newBaseCache(config CacheConfig) *baseCache {
 // Add adds a value to the cache.
 func (bc *baseCache) Add(key, value interface{}) {
 	if e := bc.store.get(key); e != nil {
-		if bc.Policy == CacheLRU {
-			bc.ll.MoveToFront(e.le)
-		}
+		bc.access(e)
 		e.value = value
 		return
 	}
 	e := &entry{key: key, value: value}
-	e.le = bc.ll.PushFront(e)
+	if bc.Policy != CacheNone {
+		e.le = bc.ll.PushFront(e)
+	}
 	bc.store.add(e)
 	// Evict as many elements as we can.
 	for bc.evict() {
@@ -143,9 +151,7 @@ func (bc *baseCache) Add(key, value interface{}) {
 // Get looks up a key's value from the cache.
 func (bc *baseCache) Get(key interface{}) (value interface{}, ok bool) {
 	if e := bc.store.get(key); e != nil {
-		if bc.Policy == CacheLRU {
-			bc.ll.MoveToFront(e.le)
-		}
+		bc.access(e)
 		return e.value, true
 	}
 	return
@@ -165,11 +171,19 @@ func (bc *baseCache) Clear() {
 
 // Len returns the number of items in the cache.
 func (bc *baseCache) Len() int {
-	return bc.ll.Len()
+	return bc.store.length()
+}
+
+func (bc *baseCache) access(e *entry) {
+	if bc.Policy == CacheLRU {
+		bc.ll.MoveToFront(e.le)
+	}
 }
 
 func (bc *baseCache) removeElement(e *entry) {
-	bc.ll.Remove(e.le)
+	if bc.Policy != CacheNone {
+		bc.ll.Remove(e.le)
+	}
 	bc.store.del(e.key)
 	if bc.OnEvicted != nil {
 		bc.OnEvicted(e.key, e.value)
@@ -180,10 +194,10 @@ func (bc *baseCache) removeElement(e *entry) {
 // the least recently used item for LRU. Returns true if an
 // entry was evicted, false otherwise.
 func (bc *baseCache) evict() bool {
-	if bc.ShouldEvict == nil {
+	if bc.ShouldEvict == nil || bc.Policy == CacheNone {
 		return false
 	}
-	l := bc.ll.Len()
+	l := bc.store.length()
 	if l > 0 {
 		ele := bc.ll.Back()
 		e := ele.Value.(*entry)
@@ -213,8 +227,8 @@ type UnorderedCache struct {
 func NewUnorderedCache(config CacheConfig) *UnorderedCache {
 	mc := &UnorderedCache{
 		baseCache: newBaseCache(config),
+		hmap:      make(map[interface{}]interface{}),
 	}
-	mc.clear()
 	mc.baseCache.store = mc
 	return mc
 }
@@ -233,7 +247,12 @@ func (mc *UnorderedCache) del(key interface{}) {
 	delete(mc.hmap, key)
 }
 func (mc *UnorderedCache) clear() {
-	mc.hmap = map[interface{}]interface{}{}
+	for key := range mc.hmap {
+		mc.Del(key)
+	}
+}
+func (mc *UnorderedCache) length() int {
+	return len(mc.hmap)
 }
 
 // OrderedCache is a cache which supports binary searches using Ceil
@@ -242,10 +261,10 @@ func (mc *UnorderedCache) clear() {
 //
 // OrderedCache requires that keys implement llrb.Comparable.
 //
-// UnorderedCache is not safe for concurrent access.
+// OrderedCache is not safe for concurrent access.
 type OrderedCache struct {
 	*baseCache
-	llrb *llrb.Tree
+	llrb llrb.Tree
 }
 
 // NewOrderedCache creates a new Cache backed by a left-leaning red
@@ -255,7 +274,6 @@ func NewOrderedCache(config CacheConfig) *OrderedCache {
 	oc := &OrderedCache{
 		baseCache: newBaseCache(config),
 	}
-	oc.clear()
 	oc.baseCache.store = oc
 	return oc
 }
@@ -274,7 +292,13 @@ func (oc *OrderedCache) del(key interface{}) {
 	oc.llrb.Delete(&entry{key: key})
 }
 func (oc *OrderedCache) clear() {
-	oc.llrb = &llrb.Tree{}
+	oc.llrb.Do(func(e llrb.Comparable) (done bool) {
+		oc.Del(e.(*entry).key)
+		return
+	})
+}
+func (oc *OrderedCache) length() int {
+	return oc.llrb.Len()
 }
 
 // Ceil returns the smallest cache entry greater than or equal to key.
@@ -297,9 +321,8 @@ func (oc *OrderedCache) Floor(key interface{}) (k, v interface{}, ok bool) {
 // match a key or range of keys. It is backed by an interval tree. See
 // comments in UnorderedCache for more details on cache functionality.
 //
-// Note that this implementation disregards the interval tree's ability
-// to store multiple identical segments. Segments are treated as unique
-// only by virtue of identical interval specifications.
+// Note that the IntervalCache allow multiple identical segments, as
+// specified by start and end keys.
 //
 // Keys supplied to the IntervalCache's Get, Add & Del methods must be
 // constructed from IntervalCache.NewKey().
@@ -311,21 +334,28 @@ type IntervalCache struct {
 	alloc int64
 }
 
-type intervalKey struct {
+type IntervalKey struct {
 	id         uintptr
 	start, end interval.Comparable
 }
 
 // Implementation of the interval.Range & interval.Mutable interfaces.
-func (ik *intervalKey) Start() interval.Comparable     { return ik.start }
-func (ik *intervalKey) End() interval.Comparable       { return ik.end }
-func (ik *intervalKey) SetStart(c interval.Comparable) { ik.start = c }
-func (ik *intervalKey) SetEnd(c interval.Comparable)   { ik.end = c }
-func (ik *intervalKey) Overlap(r interval.Range) bool {
-	ssComp := ik.start.Compare(r.Start())
-	esComp := ik.end.Compare(r.Start())
-	seComp := ik.start.Compare(r.End())
-	return ssComp == 0 || (esComp > 0 && seComp < 0)
+func (ik *IntervalKey) Start() interval.Comparable     { return ik.start }
+func (ik *IntervalKey) End() interval.Comparable       { return ik.end }
+func (ik *IntervalKey) SetStart(c interval.Comparable) { ik.start = c }
+func (ik *IntervalKey) SetEnd(c interval.Comparable)   { ik.end = c }
+func (ik *IntervalKey) Overlap(r interval.Range) bool {
+	return ik.end.Compare(r.Start()) > 0 && ik.start.Compare(r.End()) < 0
+}
+
+func (ik IntervalKey) String() string {
+	return fmt.Sprintf("%d: %q-%q", ik.id, ik.start, ik.end)
+}
+
+// Contains returns true if the specified IntervalKey is contained
+// within this IntervalKey.
+func (ik *IntervalKey) Contains(lk *IntervalKey) bool {
+	return lk.start.Compare(ik.start) >= 0 && ik.end.Compare(lk.end) >= 0
 }
 
 // NewIntervalCache creates a new Cache backed by an interval tree.
@@ -333,33 +363,32 @@ func (ik *intervalKey) Overlap(r interval.Range) bool {
 func NewIntervalCache(config CacheConfig) *IntervalCache {
 	ic := &IntervalCache{
 		baseCache: newBaseCache(config),
+		tree:      &interval.Tree{},
 	}
-	ic.clear()
 	ic.baseCache.store = ic
 	return ic
 }
 
 // NewKey creates a new interval key defined by start and end values.
-func (ic *IntervalCache) NewKey(start, end interval.Comparable) interface{} {
+func (ic *IntervalCache) NewKey(start, end interval.Comparable) *IntervalKey {
 	if start.Compare(end) > 0 {
 		panic(fmt.Sprintf("start key greater than end key %s > %s", start, end))
 	}
 	ic.alloc++
-	return &intervalKey{id: uintptr(ic.alloc), start: start, end: end}
+	return &IntervalKey{id: uintptr(ic.alloc), start: start, end: end}
 }
 
 // Implementation of cacheStore interface.
 func (ic *IntervalCache) get(key interface{}) *entry {
-	ik := key.(*intervalKey)
+	ik := key.(*IntervalKey)
 	if es := ic.tree.Get(ik); len(es) > 0 {
-		// Search interval slice for any exact match and return it.
+		// Search interval slice for any exact match on ID and return it.
 		for _, e := range es {
 			e := e.(*entry)
-			if e.Start().Compare(ik.start) == 0 && e.End().Compare(ik.end) == 0 {
+			if e.ID() == ik.id {
 				return e
 			}
 		}
-		return nil
 	}
 	return nil
 }
@@ -370,17 +399,32 @@ func (ic *IntervalCache) del(key interface{}) {
 	ic.tree.Delete(&entry{key: key}, false)
 }
 func (ic *IntervalCache) clear() {
-	ic.tree = &interval.Tree{}
+	ic.tree.Do(func(e interval.Interface) (done bool) {
+		ic.Del(e.(*entry).key.(*IntervalKey))
+		return
+	})
 	ic.alloc = 0
+}
+func (ic *IntervalCache) length() int {
+	return ic.tree.Len()
+}
+
+// Overlap contains the key/value pair for one overlap instance.
+type Overlap struct {
+	Key   *IntervalKey
+	Value interface{}
 }
 
 // GetOverlaps returns a slice of values which overlap the specified
 // interval.
-func (ic *IntervalCache) GetOverlaps(start, end interval.Comparable) []interface{} {
-	es := ic.tree.Get(ic.NewKey(start, end).(*intervalKey))
-	values := make([]interface{}, len(es))
-	for i, e := range es {
-		values[i] = e.(*entry).value
+func (ic *IntervalCache) GetOverlaps(start, end interval.Comparable) []Overlap {
+	es := ic.tree.Get(ic.NewKey(start, end))
+	values := make([]Overlap, len(es))
+	for i := range es {
+		e := es[i].(*entry)
+		ic.access(e) // maintain cache eviction ordering
+		values[i].Key = e.key.(*IntervalKey)
+		values[i].Value = e.value
 	}
 	return values
 }

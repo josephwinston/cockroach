@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -17,7 +17,11 @@
 
 package gossip
 
-import "strconv"
+import (
+	"strconv"
+
+	"github.com/cockroachdb/cockroach/proto"
+)
 
 // Constants for gossip keys.
 const (
@@ -35,12 +39,11 @@ const (
 	KeyConfigZone = "zones"
 
 	// KeyMaxAvailCapacityPrefix is the key prefix for gossiping available
-	// store capacity. The suffix is composed of:
-	// <datacenter>-<hex node ID>-<hex store ID>. The value is a
-	// storage.StoreDescriptor struct.
+	// store capacity. The suffix is composed of: <node ID>-<store ID>.
+	// The value is a storage.StoreDescriptor struct.
 	KeyMaxAvailCapacityPrefix = "max-avail-capacity-"
 
-	// KeyNodeCount is the count of gossip nodes in the network.  The
+	// KeyNodeCount is the count of gossip nodes in the network. The
 	// value is an int64 containing the count of nodes in the cluster.
 	// TODO(spencer): should remove this and instead just count the
 	//   number of node ids being gossiped.
@@ -56,14 +59,14 @@ const (
 	// node considers itself partitioned and will retry with bootstrap hosts.
 	KeySentinel = KeyClusterID
 
-	// KeyFirstRangeMetadata is the metadata for the "first" range. The
-	// "first" range contains the meta1 key range, the first level of
-	// the bi-level key addressing scheme. The value is a slice of
-	// storage.Replica structs.
-	KeyFirstRangeMetadata = "first-range"
+	// KeyFirstRangeDescriptor is the descriptor for the "first"
+	// range. The "first" range contains the meta1 key range, the first
+	// level of the bi-level key addressing scheme. The value is a slice
+	// of storage.Replica structs.
+	KeyFirstRangeDescriptor = "first-range"
 )
 
 // MakeNodeIDGossipKey returns the gossip key for node ID info.
-func MakeNodeIDGossipKey(nodeID int32) string {
+func MakeNodeIDGossipKey(nodeID proto.NodeID) string {
 	return KeyNodeIDPrefix + strconv.FormatInt(int64(nodeID), 16)
 }

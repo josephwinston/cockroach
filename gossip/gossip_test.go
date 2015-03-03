@@ -9,71 +9,53 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-package gossip
+package gossip_test
 
 import (
 	"fmt"
 	"testing"
 	"time"
-	"github.com/golang/glog"
-)
 
-const (
-	// Compressed simulation time scale for testing.
-	testGossipInterval = time.Millisecond * 10
+	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/gossip/simulation"
+	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/util/hlc"
 )
-
-// isNetworkConnected returns true if the network is fully connected with
-// no partitions.
-func isNetworkConnected(nodes map[string]*Gossip) bool {
-	for _, node := range nodes {
-		for infoKey := range nodes {
-			_, err := node.GetInfo(infoKey)
-			if err != nil {
-				glog.Infof("error: %v", err)
-				return false
-			}
-		}
-	}
-	return true
-}
 
 // verifyConvergence verifies that info from each node is visible from
 // every node in the network within numCycles cycles of the gossip protocol.
+// TODO(Tobias): Currently this test is nondeterministic, usually requiring
+// more cycles for a fully connected network on busy hardware. The clock
+// should be advanced manually instead (this requires some changes to gossip).
 func verifyConvergence(numNodes, maxCycles int, t *testing.T) {
-	var connectedAtCycle int
-	SimulateNetwork(numNodes, "unix", testGossipInterval, func(cycle int, nodes map[string]*Gossip) bool {
-		// Every node should gossip.
-		for addr, node := range nodes {
-			node.AddInfo(addr, int64(cycle), time.Hour)
-		}
-		if isNetworkConnected(nodes) {
-			connectedAtCycle = cycle
-			return false
-		}
-		return true
-	})
+	network := simulation.NewNetwork(numNodes, "unix", gossip.TestInterval, gossip.TestBootstrap)
 
-	if connectedAtCycle > maxCycles {
-		t.Errorf("expected a fully-connected network within 5 cycles; took %d", connectedAtCycle)
+	if connectedCycle := network.RunUntilFullyConnected(); connectedCycle > maxCycles {
+		t.Errorf("expected a fully-connected network within %d cycles; took %d",
+			maxCycles, connectedCycle)
 	}
+	network.Stop()
 }
 
 // TestConvergence verifies a 10 node gossip network
-// converges within 5 cycles.
+// converges within 10 cycles.
+// TODO(spencer): During race detector tests, it can take >= 8 cycles.
+// Figure out a more deterministic setup.
 func TestConvergence(t *testing.T) {
-	verifyConvergence(10, 5, t)
+	// 15 cycles to accommodate slower hardware. Usually 10 should do.
+	verifyConvergence(10, 15, t)
 }
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
-	g := New()
+	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
+	g := gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 	g.AddInfo("i", int64(1), time.Hour)
 	if val, err := g.GetInfo("i"); val.(int64) != int64(1) || err != nil {
 		t.Errorf("error fetching int64: %v", err)
@@ -100,10 +82,11 @@ func TestGossipInfoStore(t *testing.T) {
 // TestGossipGroupsInfoStore verifies gossiping of groups via the
 // gossip instance infostore.
 func TestGossipGroupsInfoStore(t *testing.T) {
-	g := New()
+	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
+	g := gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 
 	// For int64.
-	g.RegisterGroup("i", 3, MinGroup)
+	g.RegisterGroup("i", 3, gossip.MinGroup)
 	for i := 0; i < 3; i++ {
 		g.AddInfo(fmt.Sprintf("i.%d", i), int64(i), time.Hour)
 	}
@@ -124,7 +107,7 @@ func TestGossipGroupsInfoStore(t *testing.T) {
 	}
 
 	// For float64.
-	g.RegisterGroup("f", 3, MinGroup)
+	g.RegisterGroup("f", 3, gossip.MinGroup)
 	for i := 0; i < 3; i++ {
 		g.AddInfo(fmt.Sprintf("f.%d", i), float64(i), time.Hour)
 	}
@@ -142,7 +125,7 @@ func TestGossipGroupsInfoStore(t *testing.T) {
 	}
 
 	// For string.
-	g.RegisterGroup("s", 3, MinGroup)
+	g.RegisterGroup("s", 3, gossip.MinGroup)
 	for i := 0; i < 3; i++ {
 		g.AddInfo(fmt.Sprintf("s.%d", i), fmt.Sprintf("%d", i), time.Hour)
 	}

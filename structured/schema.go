@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -101,7 +101,7 @@ type Column struct {
 	// PrimaryKey specifies this column is the primary key for the table
 	// or part of a composite primary key. The order in which primary
 	// key columns are declared dictates the order in which their values
-	// are concatenated to form the key.  This has obvious implications
+	// are concatenated to form the key. This has obvious implications
 	// for range queries.
 	PrimaryKey bool `yaml:"primary_key,omitempty"`
 
@@ -162,9 +162,9 @@ func (ts TableSlice) Less(i, j int) bool { return ts[i].Name < ts[j].Name }
 // matters and small is better (for once). Schema Keys must be unique
 // within a Cockroach cluster.
 type Schema struct {
-	Name   string     `yaml:"db"`
-	Key    string     `yaml:"db_key"`
-	Tables TableSlice `yaml:",omitempty"`
+	Name   string     `yaml:"db" json:"db"`
+	Key    string     `yaml:"db_key" json:"db_key"`
+	Tables TableSlice `yaml:",omitempty" json:"tables,omitempty"`
 
 	// byName is a map from table name to *Table.
 	byName map[string]*Table
@@ -195,16 +195,16 @@ const (
 
 // Set containing all valid schema column types.
 var validTypes = map[string]struct{}{
-	columnTypeInteger:    struct{}{},
-	columnTypeFloat:      struct{}{},
-	columnTypeString:     struct{}{},
-	columnTypeBlob:       struct{}{},
-	columnTypeTime:       struct{}{},
-	columnTypeLatLong:    struct{}{},
-	columnTypeIntegerSet: struct{}{},
-	columnTypeStringSet:  struct{}{},
-	columnTypeIntegerMap: struct{}{},
-	columnTypeStringMap:  struct{}{},
+	columnTypeInteger:    {},
+	columnTypeFloat:      {},
+	columnTypeString:     {},
+	columnTypeBlob:       {},
+	columnTypeTime:       {},
+	columnTypeLatLong:    {},
+	columnTypeIntegerSet: {},
+	columnTypeStringSet:  {},
+	columnTypeIntegerMap: {},
+	columnTypeStringMap:  {},
 }
 
 // Valid index types.
@@ -217,10 +217,10 @@ const (
 
 // Set containing all valid index types.
 var validIndexTypes = map[string]struct{}{
-	indexTypeFullText:  struct{}{},
-	indexTypeLocation:  struct{}{},
-	indexTypeSecondary: struct{}{},
-	indexTypeUnique:    struct{}{},
+	indexTypeFullText:  {},
+	indexTypeLocation:  {},
+	indexTypeSecondary: {},
+	indexTypeUnique:    {},
 }
 
 // NewGoSchema returns a schema using name and key and a map from

@@ -1,0 +1,61 @@
+machine:
+  services:
+    - docker
+
+checkout:
+  post:
+    - git fetch --unshallow 2>/dev/null || true
+    - git fetch --tags
+    # Nasty hack: Because we get a freshly restored repo, timestamps do not
+    # correspond any more to when the file was last changed. To rectify this,
+    # first set everything to a timestamp in the past and then update the
+    # timestamp for all git-tracked files based on their last committed change.
+    - find . -exec touch -t 201401010000 {} \;
+    - for x in $(git ls-tree --full-tree --name-only -r HEAD); do touch -t $(date -d "$(git log -1 --format=%ci "${x}")" +%y%m%d%H%M.%S) "${x}"; done
+
+dependencies:
+  cache_directories:
+    - "~/docker"
+  override:
+    # If there's a base image cached, load it. A click on CircleCI's "Clear
+    # Cache" will make sure we start with a clean slate.
+    - mkdir -p ~/docker
+    - if [[ -e ~/docker/base.tar ]]; then docker load -i ~/docker/base.tar; fi
+    - ./build/build-docker-dev.sh
+    - docker save "cockroachdb/cockroach-devbase" > ~/docker/base.tar
+    - if [[ ! -e ~/docker/dnsmasq.tar ]]; then docker pull "cockroachdb/dnsmasq" && docker save "cockroachdb/dnsmasq" > ~/docker/dnsmasq.tar; else docker load -i ~/docker/dnsmasq.tar; fi
+    # Print the history so that we can investigate potential steps which fatten
+    # the image needlessly.
+    - docker history "cockroachdb/cockroach-dev"
+
+test:
+  override:
+    - docker run "cockroachdb/cockroach-dev" test TESTFLAGS='-logtostderr -timeout 30s -vmodule=multiraft=5' | tee "${CIRCLE_ARTIFACTS}/test.log"; test ${PIPESTATUS[0]} -eq 0
+    - docker run "cockroachdb/cockroach-dev" testrace RACEFLAGS='-logtostderr -timeout 5m -vmodule=multiraft=5' | tee "${CIRCLE_ARTIFACTS}/testrace.log"; test ${PIPESTATUS[0]} -eq 0
+      # Kill off the previous images since we don't care for them any more,
+      # but we do want to save the logs for the following ones.
+      # `docker rm` actually errors on CircleCI but still works, hence the ';'.
+    - docker rm $(docker ps -aq) || true
+    - make acceptance
+  post:
+      # Write the container's log output to artifacts.
+    - i=0; for cid in $(docker ps -aq); do i=$((i+1)); docker logs $cid &> "${CIRCLE_ARTIFACTS}/${i}_${cid}.log"; done
+
+deployment:
+  docker:
+    branch: master
+    commands:
+      - sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < "resources/deploy_templates/.dockercfg.template" > ~/.dockercfg
+      - |
+          VERSION=$(git describe 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
+          echo "Deploying ${VERSION}..."
+          if [ -n "$DOCKER_EMAIL" ]; then
+            ./build/build-docker-deploy.sh && \
+            make COCKROACH_IMAGE="cockroachdb/cockroach" acceptance && \
+            docker tag cockroachdb/cockroach:latest cockroachdb/cockroach:${VERSION} && \
+            docker tag cockroachdb/cockroach-dev:latest cockroachdb/cockroach-dev:${VERSION} && \
+            docker push cockroachdb/cockroach:latest && \
+            docker push cockroachdb/cockroach:${VERSION} && \
+            docker push cockroachdb/cockroach-dev:latest && \
+            docker push cockroachdb/cockroach-dev:${VERSION}
+          fi

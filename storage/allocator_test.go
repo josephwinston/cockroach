@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -20,53 +20,55 @@ package storage
 import (
 	"math/rand"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/storage/engine"
 )
 
-var simpleZoneConfig = ZoneConfig{
-	Replicas: []Attributes{
-		Attributes([]string{"a", "ssd"}),
+var simpleZoneConfig = proto.ZoneConfig{
+	ReplicaAttrs: []proto.Attributes{
+		{Attrs: []string{"a", "ssd"}},
 	},
 }
 
-var multiDisksConfig = ZoneConfig{
-	Replicas: []Attributes{
-		Attributes([]string{"a", "ssd"}),
-		Attributes([]string{"a", "hdd"}),
-		Attributes([]string{"a", "mem"}),
+var multiDisksConfig = proto.ZoneConfig{
+	ReplicaAttrs: []proto.Attributes{
+		{Attrs: []string{"a", "ssd"}},
+		{Attrs: []string{"a", "hdd"}},
+		{Attrs: []string{"a", "mem"}},
 	},
 }
 
-var multiDCConfig = ZoneConfig{
-	Replicas: []Attributes{
-		Attributes([]string{"a", "ssd"}),
-		Attributes([]string{"b", "ssd"}),
+var multiDCConfig = proto.ZoneConfig{
+	ReplicaAttrs: []proto.Attributes{
+		{Attrs: []string{"a", "ssd"}},
+		{Attrs: []string{"b", "ssd"}},
 	},
 }
 
 // filterStores returns just the store descriptors in the supplied
 // stores slice which contain all the specified attributes.
-func filterStores(a Attributes, stores []*StoreDescriptor) ([]*StoreDescriptor, error) {
+func filterStores(a proto.Attributes, stores []*StoreDescriptor) ([]*StoreDescriptor, error) {
 	var filtered []*StoreDescriptor
 	for _, s := range stores {
-		b := []string(s.Attrs)
-		b = append(b, []string(s.Node.Attrs)...)
-		if a.IsSubset(Attributes(b)) {
+		sAttrs := s.CombinedAttrs()
+		if a.IsSubset(*sAttrs) {
 			filtered = append(filtered, s)
 		}
 	}
 	return filtered, nil
 }
 
-var singleStore = func(a Attributes) ([]*StoreDescriptor, error) {
+var singleStore = func(a proto.Attributes) ([]*StoreDescriptor, error) {
 	return filterStores(a, []*StoreDescriptor{
-		&StoreDescriptor{
+		{
 			StoreID: 1,
-			Attrs:   Attributes([]string{"ssd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"ssd"}},
 			Node: NodeDescriptor{
 				NodeID: 1,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
@@ -74,64 +76,64 @@ var singleStore = func(a Attributes) ([]*StoreDescriptor, error) {
 	})
 }
 
-var sameDCStores = func(a Attributes) ([]*StoreDescriptor, error) {
+var sameDCStores = func(a proto.Attributes) ([]*StoreDescriptor, error) {
 	return filterStores(a, []*StoreDescriptor{
-		&StoreDescriptor{
+		{
 			StoreID: 1,
-			Attrs:   Attributes([]string{"ssd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"ssd"}},
 			Node: NodeDescriptor{
 				NodeID: 1,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
 		},
-		&StoreDescriptor{
+		{
 			StoreID: 2,
-			Attrs:   Attributes([]string{"ssd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"ssd"}},
 			Node: NodeDescriptor{
 				NodeID: 2,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
 		},
-		&StoreDescriptor{
+		{
 			StoreID: 3,
-			Attrs:   Attributes([]string{"hdd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"hdd"}},
 			Node: NodeDescriptor{
 				NodeID: 2,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
 		},
-		&StoreDescriptor{
+		{
 			StoreID: 4,
-			Attrs:   Attributes([]string{"hdd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"hdd"}},
 			Node: NodeDescriptor{
 				NodeID: 3,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
 		},
-		&StoreDescriptor{
+		{
 			StoreID: 5,
-			Attrs:   Attributes([]string{"mem"}),
+			Attrs:   proto.Attributes{Attrs: []string{"mem"}},
 			Node: NodeDescriptor{
 				NodeID: 4,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
@@ -139,28 +141,28 @@ var sameDCStores = func(a Attributes) ([]*StoreDescriptor, error) {
 	})
 }
 
-var multiDCStores = func(a Attributes) ([]*StoreDescriptor, error) {
+var multiDCStores = func(a proto.Attributes) ([]*StoreDescriptor, error) {
 	return filterStores(a, []*StoreDescriptor{
-		&StoreDescriptor{
+		{
 			StoreID: 1,
-			Attrs:   Attributes([]string{"ssd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"ssd"}},
 			Node: NodeDescriptor{
 				NodeID: 1,
-				Attrs:  Attributes([]string{"a"}),
+				Attrs:  proto.Attributes{Attrs: []string{"a"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
 		},
-		&StoreDescriptor{
+		{
 			StoreID: 2,
-			Attrs:   Attributes([]string{"ssd"}),
+			Attrs:   proto.Attributes{Attrs: []string{"ssd"}},
 			Node: NodeDescriptor{
 				NodeID: 2,
-				Attrs:  Attributes([]string{"b"}),
+				Attrs:  proto.Attributes{Attrs: []string{"b"}},
 			},
-			Capacity: StoreCapacity{
+			Capacity: engine.StoreCapacity{
 				Capacity:  100,
 				Available: 100,
 			},
@@ -168,7 +170,7 @@ var multiDCStores = func(a Attributes) ([]*StoreDescriptor, error) {
 	})
 }
 
-var noStores = func(a Attributes) ([]*StoreDescriptor, error) {
+var noStores = func(a proto.Attributes) ([]*StoreDescriptor, error) {
 	return filterStores(a, []*StoreDescriptor{})
 }
 
@@ -177,7 +179,7 @@ func TestSimpleRetrieval(t *testing.T) {
 		storeFinder: singleStore,
 		rand:        *rand.New(rand.NewSource(0)),
 	}
-	result, err := a.allocate(simpleZoneConfig.Replicas[0], []Replica{})
+	result, err := a.allocate(simpleZoneConfig.ReplicaAttrs[0], []proto.Replica{})
 	if err != nil {
 		t.Errorf("Unable to perform allocation: %v", err)
 	}
@@ -191,7 +193,7 @@ func TestNoAvailableDisks(t *testing.T) {
 		storeFinder: noStores,
 		rand:        *rand.New(rand.NewSource(0)),
 	}
-	result, err := a.allocate(simpleZoneConfig.Replicas[0], []Replica{})
+	result, err := a.allocate(simpleZoneConfig.ReplicaAttrs[0], []proto.Replica{})
 	if result != nil {
 		t.Errorf("expected nil result: %+v", result)
 	}
@@ -205,21 +207,21 @@ func TestThreeDisksSameDC(t *testing.T) {
 		storeFinder: sameDCStores,
 		rand:        *rand.New(rand.NewSource(0)),
 	}
-	result1, err := a.allocate(multiDisksConfig.Replicas[0], []Replica{})
+	result1, err := a.allocate(multiDisksConfig.ReplicaAttrs[0], []proto.Replica{})
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %v", err)
 	}
 	if result1.StoreID != 2 {
 		t.Errorf("Expected store 2; got %+v", result1)
 	}
-	exReplicas := []Replica{
-		Replica{
+	exReplicas := []proto.Replica{
+		{
 			NodeID:  result1.Node.NodeID,
 			StoreID: result1.StoreID,
-			Attrs:   multiDisksConfig.Replicas[0],
+			Attrs:   multiDisksConfig.ReplicaAttrs[0],
 		},
 	}
-	result2, err := a.allocate(multiDisksConfig.Replicas[1], exReplicas)
+	result2, err := a.allocate(multiDisksConfig.ReplicaAttrs[1], exReplicas)
 	if err != nil {
 		t.Errorf("Unable to perform allocation: %v", err)
 	}
@@ -229,7 +231,7 @@ func TestThreeDisksSameDC(t *testing.T) {
 	if result1.Node.NodeID == result2.Node.NodeID {
 		t.Errorf("Expected node ids to be different %+v vs %+v", result1, result2)
 	}
-	result3, err := a.allocate(multiDisksConfig.Replicas[2], []Replica{})
+	result3, err := a.allocate(multiDisksConfig.ReplicaAttrs[2], []proto.Replica{})
 	if err != nil {
 		t.Errorf("Unable to perform allocation: %v", err)
 	}
@@ -243,11 +245,11 @@ func TestTwoDatacenters(t *testing.T) {
 		storeFinder: multiDCStores,
 		rand:        *rand.New(rand.NewSource(0)),
 	}
-	result1, err := a.allocate(multiDCConfig.Replicas[0], []Replica{})
+	result1, err := a.allocate(multiDCConfig.ReplicaAttrs[0], []proto.Replica{})
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %v", err)
 	}
-	result2, err := a.allocate(multiDCConfig.Replicas[1], []Replica{})
+	result2, err := a.allocate(multiDCConfig.ReplicaAttrs[1], []proto.Replica{})
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %v", err)
 	}
@@ -255,11 +257,11 @@ func TestTwoDatacenters(t *testing.T) {
 		t.Errorf("Expected nodes 1 & 2: %+v vs %+v", result1.Node, result2.Node)
 	}
 	// Verify that no result is forthcoming if we already have a replica.
-	_, err = a.allocate(multiDCConfig.Replicas[1], []Replica{
-		Replica{
+	_, err = a.allocate(multiDCConfig.ReplicaAttrs[1], []proto.Replica{
+		{
 			NodeID:  result2.Node.NodeID,
 			StoreID: result2.StoreID,
-			Attrs:   multiDCConfig.Replicas[1],
+			Attrs:   multiDCConfig.ReplicaAttrs[1],
 		},
 	})
 	if err == nil {
@@ -272,11 +274,11 @@ func TestExistingReplica(t *testing.T) {
 		storeFinder: sameDCStores,
 		rand:        *rand.New(rand.NewSource(0)),
 	}
-	result, err := a.allocate(multiDisksConfig.Replicas[1], []Replica{
-		Replica{
+	result, err := a.allocate(multiDisksConfig.ReplicaAttrs[1], []proto.Replica{
+		{
 			NodeID:  1,
 			StoreID: 1,
-			Attrs:   multiDisksConfig.Replicas[0],
+			Attrs:   multiDisksConfig.ReplicaAttrs[0],
 		},
 	})
 	if err != nil {

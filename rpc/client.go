@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -24,12 +24,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/rpc/codec"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 const (
 	defaultHeartbeatInterval = 3 * time.Second // 3s
+
+	// Affects maximum error in reading the clock of the remote. 1.5 seconds is
+	// the longest NTP allows for a remote clock reading. After 1.5 seconds, we
+	// assume that the offset from the clock is infinite.
+	maximumClockReadingDelay = 1500 * time.Millisecond
 )
 
 var (
@@ -59,12 +67,15 @@ type Client struct {
 	Ready  chan struct{} // Closed when client is connected
 	Closed chan struct{} // Closed when connection has closed
 
-	mu          sync.RWMutex // Mutex protects the fields below
-	*rpc.Client              // Embedded RPC client
-	addr        net.Addr     // Remote address of client
-	lAddr       net.Addr     // Local address of client
-	healthy     bool
-	closed      bool
+	mu           sync.Mutex // Mutex protects the fields below
+	*rpc.Client             // Embedded RPC client
+	addr         net.Addr   // Remote address of client
+	lAddr        net.Addr   // Local address of client
+	healthy      bool
+	closed       bool
+	offset       proto.RemoteOffset // Latest measured clock offset from the server
+	clock        *hlc.Clock
+	remoteClocks *RemoteClockMonitor
 }
 
 // NewClient returns a client RPC stub for the specified address
@@ -79,63 +90,67 @@ type Client struct {
 // and completed one successful heartbeat. The Closed channel is
 // closed if the client fails to connect or if the client's Close()
 // method is invoked.
-func NewClient(addr net.Addr, opts *util.RetryOptions) *Client {
+func NewClient(addr net.Addr, opts *util.RetryOptions, context *Context) *Client {
 	clientMu.Lock()
 	if c, ok := clients[addr.String()]; ok {
 		clientMu.Unlock()
 		return c
 	}
 	c := &Client{
-		addr:   addr,
-		Ready:  make(chan struct{}),
-		Closed: make(chan struct{}),
+		addr:         addr,
+		Ready:        make(chan struct{}),
+		Closed:       make(chan struct{}),
+		clock:        context.localClock,
+		remoteClocks: context.RemoteClocks,
 	}
 	clients[c.Addr().String()] = c
 	clientMu.Unlock()
 
+	go c.connect(opts, context)
+	return c
+}
+
+// connect dials the connection in a backoff/retry loop.
+func (c *Client) connect(opts *util.RetryOptions, context *Context) {
 	// Attempt to dial connection.
 	retryOpts := clientRetryOptions
 	if opts != nil {
 		retryOpts = *opts
 	}
-	retryOpts.Tag = fmt.Sprintf("client %s connection", addr)
+	retryOpts.Tag = fmt.Sprintf("client %s connection", c.addr)
 
-	go func() {
-		err := util.RetryWithBackoff(retryOpts, func() (bool, error) {
-			// TODO(spencer): use crypto.tls.
-			conn, err := net.Dial(addr.Network(), addr.String())
-			if err != nil {
-				glog.Info(err)
-				return false, nil
-			}
-			c.mu.Lock()
-			c.Client = rpc.NewClient(conn)
-			c.lAddr = conn.LocalAddr()
-			c.mu.Unlock()
-
-			// Ensure at least one heartbeat succeeds before exiting the
-			// retry loop.
-			if err = c.heartbeat(); err != nil {
-				c.Close()
-				return false, err
-			}
-
-			// Signal client is ready by closing Ready channel.
-			glog.Infof("client %s connected", addr)
-			close(c.Ready)
-
-			// Launch periodic heartbeat.
-			go c.startHeartbeat()
-
-			return true, nil
-		})
+	err := util.RetryWithBackoff(retryOpts, func() (util.RetryStatus, error) {
+		conn, err := tlsDial(c.addr.Network(), c.addr.String(), context.tlsConfig)
 		if err != nil {
-			glog.Errorf("client %s failed to connect", addr)
-			c.Close()
+			log.Info(err)
+			return util.RetryContinue, nil
 		}
-	}()
 
-	return c
+		c.mu.Lock()
+		c.Client = rpc.NewClientWithCodec(codec.NewClientCodec(conn))
+		c.lAddr = conn.LocalAddr()
+		c.mu.Unlock()
+
+		// Ensure at least one heartbeat succeeds before exiting the
+		// retry loop.
+		if err = c.heartbeat(); err != nil {
+			c.Close()
+			return util.RetryContinue, err
+		}
+
+		// Signal client is ready by closing Ready channel.
+		log.Infof("client %s connected", c.addr)
+		close(c.Ready)
+
+		// Launch periodic heartbeat.
+		go c.startHeartbeat()
+
+		return util.RetryBreak, nil
+	})
+	if err != nil {
+		log.Errorf("client %s failed to connect: %v", c.addr, err)
+		c.Close()
+	}
 }
 
 // IsConnected returns whether the client is connected.
@@ -154,16 +169,24 @@ func (c *Client) IsHealthy() bool {
 
 // Addr returns remote address of the client.
 func (c *Client) Addr() net.Addr {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.addr
 }
 
 // LocalAddr returns the local address of the client.
 func (c *Client) LocalAddr() net.Addr {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.lAddr
+}
+
+// RemoteOffset returns the most recently measured offset of the client clock
+// from the remote server clock.
+func (c *Client) RemoteOffset() proto.RemoteOffset {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.offset
 }
 
 // Close removes the client from the clients map and closes
@@ -184,36 +207,59 @@ func (c *Client) Close() {
 // connection on error. Heartbeats are sent in an infinite loop until
 // an error is encountered.
 func (c *Client) startHeartbeat() {
-	glog.Infof("client %s starting heartbeat", c.Addr())
+	log.Infof("client %s starting heartbeat", c.Addr())
 	// On heartbeat failure, remove this client from cache. A new
 	// client to this address will be created on the next call to
 	// NewClient().
 	for {
 		time.Sleep(heartbeatInterval)
 		if err := c.heartbeat(); err != nil {
-			glog.Infof("client %s heartbeat failed: %v; recycling...", c.Addr(), err)
+			log.Infof("client %s heartbeat failed: %v; recycling...", c.Addr(), err)
 			c.Close()
 			break
 		}
 	}
 }
 
-// heartbeat sends a single heartbeat RPC.
+// heartbeat sends a single heartbeat RPC. As part of the heartbeat protocol,
+// it measures the clock of the remote to determine the node's clock offset
+// from the remote.
 func (c *Client) heartbeat() error {
-	call := c.Go("Heartbeat.Ping", &PingRequest{}, &PingResponse{}, nil)
+	request := &proto.PingRequest{Offset: c.RemoteOffset(), Addr: c.LocalAddr().String()}
+	response := &proto.PingResponse{}
+	sendTime := c.clock.PhysicalNow()
+	call := c.Go("Heartbeat.Ping", request, response, nil)
 	select {
 	case <-call.Done:
-		glog.V(1).Infof("client %s heartbeat: %v", c.Addr(), call.Error)
+		receiveTime := c.clock.PhysicalNow()
+		log.V(1).Infof("client %s heartbeat: %v", c.Addr(), call.Error)
 		c.mu.Lock()
 		c.healthy = true
+		c.offset.MeasuredAt = receiveTime
+		if receiveTime-sendTime > maximumClockReadingDelay.Nanoseconds() {
+			c.offset = proto.InfiniteOffset
+		} else {
+			// Offset and error are measured using the remote clock reading
+			// technique described in
+			// http://se.inf.tu-dresden.de/pubs/papers/SRDS1994.pdf, page 6.
+			// However, we assume that drift and min message delay are 0, for
+			// now.
+			c.offset.Error = (receiveTime - sendTime) / 2
+			remoteTimeNow := response.ServerTime + (receiveTime-sendTime)/2
+			c.offset.Offset = remoteTimeNow - receiveTime
+		}
 		c.mu.Unlock()
+		c.remoteClocks.UpdateOffset(c.addr.String(), c.offset)
 		return call.Error
 	case <-time.After(heartbeatInterval * 2):
 		// Allowed twice gossip interval.
 		c.mu.Lock()
 		c.healthy = false
+		c.offset = proto.InfiniteOffset
+		c.offset.MeasuredAt = c.clock.PhysicalNow()
 		c.mu.Unlock()
-		glog.Warningf("client %s unhealthy after %s", c.Addr(), heartbeatInterval)
+		c.remoteClocks.UpdateOffset(c.addr.String(), c.offset)
+		log.Warningf("client %s unhealthy after %s", c.Addr(), heartbeatInterval)
 	}
 
 	<-call.Done

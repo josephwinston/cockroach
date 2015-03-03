@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -40,6 +40,16 @@ func TestRandIntInRange(t *testing.T) {
 		x := RandIntInRange(rand, 20, 40)
 		if x < 20 || x >= 40 {
 			t.Errorf("got result out of range: %d", x)
+		}
+	}
+}
+
+func TestRandString(t *testing.T) {
+	rand := NewPseudoRand()
+	for i := 0; i < 100; i++ {
+		x := RandString(rand, i)
+		if len(x) != i {
+			t.Errorf("got array with unexpected length: %d (expected %d)", len(x), i)
 		}
 	}
 }

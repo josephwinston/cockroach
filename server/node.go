@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -23,12 +23,17 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/kv"
+	"github.com/cockroachdb/cockroach/multiraft"
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/storage"
+	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 const (
@@ -47,17 +52,17 @@ const (
 // traffic. A node is the top-level data structure. There is one node
 // instance per process. A node accepts incoming RPCs and services
 // them by directing the commands contained within RPCs to local
-// stores, which in turn direct the commands to specific ranges.  Each
+// stores, which in turn direct the commands to specific ranges. Each
 // node has access to the global, monolithic Key-Value abstraction via
-// its "distDB" reference. Nodes use this to allocate node and store
+// its kv.DB reference. Nodes use this to allocate node and store
 // IDs for bootstrapping the node itself or new stores as they're added
 // on subsequent instantiations.
 type Node struct {
 	ClusterID  string                 // UUID for Cockroach cluster
 	Descriptor storage.NodeDescriptor // Node ID, network/physical topology
 	gossip     *gossip.Gossip         // Nodes gossip cluster ID, node ID -> host:port
-	distDB     kv.DB                  // Global KV DB; used to access global id generators
-	localDB    *kv.LocalDB            // Local KV DB for access to node-local stores
+	db         *client.KV             // KV DB client; used to access global id generators
+	lSender    *kv.LocalSender        // Local KV sender for access to node-local stores
 	closer     chan struct{}
 
 	maxAvailPrefix string // Prefix for max avail capacity gossip topic
@@ -65,54 +70,57 @@ type Node struct {
 
 // allocateNodeID increments the node id generator key to allocate
 // a new, unique node id.
-func allocateNodeID(db kv.DB) (int32, error) {
-	ir := <-db.Increment(&storage.IncrementRequest{
-		RequestHeader: storage.RequestHeader{
-			Key:  storage.KeyNodeIDGenerator,
+func allocateNodeID(db *client.KV) (proto.NodeID, error) {
+	iReply := &proto.IncrementResponse{}
+	if err := db.Call(proto.Increment, &proto.IncrementRequest{
+		RequestHeader: proto.RequestHeader{
+			Key:  engine.KeyNodeIDGenerator,
 			User: storage.UserRoot,
 		},
 		Increment: 1,
-	})
-	if ir.Error != nil {
-		return 0, util.Errorf("unable to allocate node ID: %v", ir.Error)
+	}, iReply); err != nil {
+		return 0, util.Errorf("unable to allocate node ID: %v", err)
 	}
-	return int32(ir.NewValue), nil
+	return proto.NodeID(iReply.NewValue), nil
 }
 
 // allocateStoreIDs increments the store id generator key for the
 // specified node to allocate "inc" new, unique store ids. The
 // first ID in a contiguous range is returned on success.
-func allocateStoreIDs(nodeID int32, inc int64, db kv.DB) (int32, error) {
-	ir := <-db.Increment(&storage.IncrementRequest{
-		// The Key is a concatenation of StoreIDGeneratorPrefix and this node's ID.
-		RequestHeader: storage.RequestHeader{
-			Key:  storage.MakeKey(storage.KeyStoreIDGeneratorPrefix, []byte(strconv.Itoa(int(nodeID)))),
+func allocateStoreIDs(nodeID proto.NodeID, inc int64, db *client.KV) (proto.StoreID, error) {
+	iReply := &proto.IncrementResponse{}
+	if err := db.Call(proto.Increment, &proto.IncrementRequest{
+		RequestHeader: proto.RequestHeader{
+			Key:  engine.MakeKey(engine.KeyStoreIDGeneratorPrefix, []byte(strconv.Itoa(int(nodeID)))),
 			User: storage.UserRoot,
 		},
 		Increment: inc,
-	})
-	if ir.Error != nil {
-		return 0, util.Errorf("unable to allocate %d store IDs for node %d: %v", inc, nodeID, ir.Error)
+	}, iReply); err != nil {
+		return 0, util.Errorf("unable to allocate %d store IDs for node %d: %v", inc, nodeID, err)
 	}
-	return int32(ir.NewValue - inc + 1), nil
+	return proto.StoreID(iReply.NewValue - inc + 1), nil
 }
 
 // BootstrapCluster bootstraps a store using the provided engine and
 // cluster ID. The bootstrapped store contains a single range spanning
 // all keys. Initial range lookup metadata is populated for the range.
 //
-// Returns a direct-access kv.LocalDB for unittest purposes only.
-func BootstrapCluster(clusterID string, engine storage.Engine) (
-	*kv.LocalDB, error) {
-	sIdent := storage.StoreIdent{
+// Returns a KV client for unittest purposes. Caller should close
+// the returned client.
+func BootstrapCluster(clusterID string, eng engine.Engine) (*client.KV, error) {
+	sIdent := proto.StoreIdent{
 		ClusterID: clusterID,
 		NodeID:    1,
 		StoreID:   1,
 	}
-	s := storage.NewStore(engine, nil)
+	clock := hlc.NewClock(hlc.UnixNano)
+	// Create a KV DB with a local sender.
+	lSender := kv.NewLocalSender()
+	localDB := client.NewKV(kv.NewTxnCoordSender(lSender, clock, false), nil)
+	s := storage.NewStore(clock, eng, localDB, nil, multiraft.NewLocalRPCTransport())
 
 	// Verify the store isn't already part of a cluster.
-	if s.Ident.ClusterID != "" {
+	if len(s.Ident.ClusterID) > 0 {
 		return nil, util.Errorf("storage engine already belongs to a cluster (%s)", s.Ident.ClusterID)
 	}
 
@@ -120,43 +128,14 @@ func BootstrapCluster(clusterID string, engine storage.Engine) (
 	if err := s.Bootstrap(sIdent); err != nil {
 		return nil, err
 	}
-
-	if err := s.Init(); err != nil {
-		return nil, err
-	}
-
 	// Create first range.
-	replica := storage.Replica{
-		NodeID:  1,
-		StoreID: 1,
-		RangeID: 1,
-		Attrs:   storage.Attributes{},
-	}
-	rng, err := s.CreateRange(storage.KeyMin, storage.KeyMax, []storage.Replica{replica})
-	if err != nil {
+	if err := s.BootstrapRange(); err != nil {
 		return nil, err
 	}
-	if rng.Meta.RangeID != 1 {
-		return nil, util.Errorf("expected range id of 1, got %d", rng.Meta.RangeID)
-	}
-
-	// Create a local DB to directly modify the new range.
-	localDB := kv.NewLocalDB()
-	localDB.AddStore(s)
-
-	// Initialize range addressing records and default administrative configs.
-	desc := storage.RangeDescriptor{
-		StartKey: storage.KeyMin,
-		Replicas: []storage.Replica{replica},
-	}
-	if err := kv.BootstrapRangeDescriptor(localDB, desc); err != nil {
+	if err := s.Start(); err != nil {
 		return nil, err
 	}
-
-	// Write default configs to local DB.
-	if err := kv.BootstrapConfigs(localDB); err != nil {
-		return nil, err
-	}
+	lSender.AddStore(s)
 
 	// Initialize node and store ids after the fact to account
 	// for use of node ID = 1 and store ID = 1.
@@ -175,11 +154,11 @@ func BootstrapCluster(clusterID string, engine storage.Engine) (
 // NewNode returns a new instance of Node, interpreting command line
 // flags to initialize the appropriate Store or set of
 // Stores. Registers the storage instance for the RPC service "Node".
-func NewNode(distDB kv.DB, gossip *gossip.Gossip) *Node {
+func NewNode(db *client.KV, gossip *gossip.Gossip) *Node {
 	n := &Node{
 		gossip:  gossip,
-		distDB:  distDB,
-		localDB: kv.NewLocalDB(),
+		db:      db,
+		lSender: kv.NewLocalSender(),
 		closer:  make(chan struct{}),
 	}
 	return n
@@ -188,7 +167,7 @@ func NewNode(distDB kv.DB, gossip *gossip.Gossip) *Node {
 // initDescriptor initializes the physical/network topology attributes
 // if possible. Datacenter, PDU & Rack values are taken from environment
 // variables or command line flags.
-func (n *Node) initDescriptor(addr net.Addr, attrs storage.Attributes) {
+func (n *Node) initDescriptor(addr net.Addr, attrs proto.Attributes) {
 	n.Descriptor = storage.NodeDescriptor{
 		// NodeID is after invocation of start()
 		Address: addr,
@@ -198,45 +177,51 @@ func (n *Node) initDescriptor(addr net.Addr, attrs storage.Attributes) {
 
 // start starts the node by initializing network/physical topology
 // attributes gleaned from the environment and initializing stores
-// for each specified engine. Launches periodic store gossipping
+// for each specified engine. Launches periodic store gossiping
 // in a goroutine.
-func (n *Node) start(rpcServer *rpc.Server, engines []storage.Engine,
-	attrs storage.Attributes) error {
+func (n *Node) start(rpcServer *rpc.Server, clock *hlc.Clock,
+	engines []engine.Engine, attrs proto.Attributes) error {
 	n.initDescriptor(rpcServer.Addr(), attrs)
-	rpcServer.RegisterName("Node", n)
+	if err := rpcServer.RegisterName("Node", n); err != nil {
+		log.Fatalf("unable to register node service with RPC server: %s", err)
+	}
 
-	if err := n.initStores(engines); err != nil {
+	// Initialize stores, including bootstrapping new ones.
+	if err := n.initStores(clock, engines); err != nil {
 		return err
 	}
 	go n.startGossip()
-
+	log.Infof("Started node with %v engine(s) and attributes %v", engines, attrs)
 	return nil
 }
 
 // stop cleanly stops the node.
 func (n *Node) stop() {
 	close(n.closer)
-	n.localDB.Close()
 }
 
 // initStores initializes the Stores map from id to Store. Stores are
-// added to the localDB if already bootstrapped. A bootstrapped Store
-// has a valid ident with cluster, node and Store IDs set. If the
-// Store doesn't yet have a valid ident, it's added to the bootstraps
-// list for initialization once the cluster and node IDs have been
-// determined.
-func (n *Node) initStores(engines []storage.Engine) error {
+// added to the local sender if already bootstrapped. A bootstrapped
+// Store has a valid ident with cluster, node and Store IDs set. If
+// the Store doesn't yet have a valid ident, it's added to the
+// bootstraps list for initialization once the cluster and node IDs
+// have been determined.
+func (n *Node) initStores(clock *hlc.Clock, engines []engine.Engine) error {
 	bootstraps := list.New()
 
-	for _, engine := range engines {
-		s := storage.NewStore(engine, n.gossip)
-		// If not bootstrapped, add to list.
-		if !s.IsBootstrapped() {
-			bootstraps.PushBack(s)
-			continue
-		}
-		// Otherwise, initialize each store in turn.
-		if err := s.Init(); err != nil {
+	if len(engines) == 0 {
+		return util.Error("no engines")
+	}
+	for _, e := range engines {
+		// TODO(bdarnell): use a real transport here instead of NewLocalRPCTransport
+		s := storage.NewStore(clock, e, n.db, n.gossip, multiraft.NewLocalRPCTransport())
+		// Initialize each store in turn, handling un-bootstrapped errors by
+		// adding the store to the bootstraps list.
+		if err := s.Start(); err != nil {
+			if _, ok := err.(*storage.NotBootstrappedError); ok {
+				bootstraps.PushBack(s)
+				continue
+			}
 			return err
 		}
 		if s.Ident.ClusterID != "" {
@@ -247,8 +232,8 @@ func (n *Node) initStores(engines []storage.Engine) error {
 			if err != nil {
 				return err
 			}
-			glog.Infof("initialized store %s: %+v", s, capacity)
-			n.localDB.AddStore(s)
+			log.Infof("initialized store %s: %+v", s, capacity)
+			n.lSender.AddStore(s)
 		}
 	}
 
@@ -273,7 +258,7 @@ func (n *Node) initStores(engines []storage.Engine) error {
 // cluster ID and node ID. The node's ident is initialized based on
 // the agreed-upon cluster and node IDs.
 func (n *Node) validateStores() error {
-	return n.localDB.VisitStores(func(s *storage.Store) error {
+	return n.lSender.VisitStores(func(s *storage.Store) error {
 		if s.Ident.ClusterID == "" || s.Ident.NodeID == 0 {
 			return util.Errorf("unidentified store in store map: %s", s)
 		}
@@ -294,31 +279,31 @@ func (n *Node) validateStores() error {
 // allocated via a sequence id generator stored at a system key per
 // node.
 func (n *Node) bootstrapStores(bootstraps *list.List) {
-	glog.Infof("bootstrapping %d store(s)", bootstraps.Len())
+	log.Infof("bootstrapping %d store(s)", bootstraps.Len())
 
 	// Allocate a new node ID if necessary.
 	if n.Descriptor.NodeID == 0 {
 		var err error
-		n.Descriptor.NodeID, err = allocateNodeID(n.distDB)
-		glog.Infof("new node allocated ID %d", n.Descriptor.NodeID)
+		n.Descriptor.NodeID, err = allocateNodeID(n.db)
+		log.Infof("new node allocated ID %d", n.Descriptor.NodeID)
 		if err != nil {
-			glog.Fatal(err)
+			log.Fatal(err)
 		}
 		// Gossip node address keyed by node ID.
 		nodeIDKey := gossip.MakeNodeIDGossipKey(n.Descriptor.NodeID)
 		if err := n.gossip.AddInfo(nodeIDKey, n.Descriptor.Address, ttlNodeIDGossip); err != nil {
-			glog.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
+			log.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
 		}
 	}
 
 	// Bootstrap all waiting stores by allocating a new store id for
 	// each and invoking store.Bootstrap() to persist.
 	inc := int64(bootstraps.Len())
-	firstID, err := allocateStoreIDs(n.Descriptor.NodeID, inc, n.distDB)
+	firstID, err := allocateStoreIDs(n.Descriptor.NodeID, inc, n.db)
 	if err != nil {
-		glog.Fatal(err)
+		log.Fatal(err)
 	}
-	sIdent := storage.StoreIdent{
+	sIdent := proto.StoreIdent{
 		ClusterID: n.ClusterID,
 		NodeID:    n.Descriptor.NodeID,
 		StoreID:   firstID,
@@ -326,39 +311,41 @@ func (n *Node) bootstrapStores(bootstraps *list.List) {
 	for e := bootstraps.Front(); e != nil; e = e.Next() {
 		s := e.Value.(*storage.Store)
 		s.Bootstrap(sIdent)
-		n.localDB.AddStore(s)
+		n.lSender.AddStore(s)
 		sIdent.StoreID++
-		glog.Infof("bootstrapped store %s", s)
+		log.Infof("bootstrapped store %s", s)
 	}
 }
 
 // connectGossip connects to gossip network and reads cluster ID. If
 // this node is already part of a cluster, the cluster ID is verified
 // for a match. If not part of a cluster, the cluster ID is set. The
-// node's address is gossipped with node ID as the gossip key.
+// node's address is gossiped with node ID as the gossip key.
 func (n *Node) connectGossip() {
-	glog.Infof("connecting to gossip network to verify cluster ID...")
+	log.Infof("connecting to gossip network to verify cluster ID...")
+	// No timeout or stop condition is needed here. Log statements should be
+	// sufficient for diagnosing this type of condition.
 	<-n.gossip.Connected
 
 	val, err := n.gossip.GetInfo(gossip.KeyClusterID)
 	if err != nil || val == nil {
-		glog.Fatalf("unable to ascertain cluster ID from gossip network: %v", err)
+		log.Fatalf("unable to ascertain cluster ID from gossip network: %v", err)
 	}
 	gossipClusterID := val.(string)
 
 	if n.ClusterID == "" {
 		n.ClusterID = gossipClusterID
 	} else if n.ClusterID != gossipClusterID {
-		glog.Fatalf("node %d belongs to cluster %q but is attempting to connect to a gossip network for cluster %q",
+		log.Fatalf("node %d belongs to cluster %q but is attempting to connect to a gossip network for cluster %q",
 			n.Descriptor.NodeID, n.ClusterID, gossipClusterID)
 	}
-	glog.Infof("node connected via gossip and verified as part of cluster %q", gossipClusterID)
+	log.Infof("node connected via gossip and verified as part of cluster %q", gossipClusterID)
 
 	// Gossip node address keyed by node ID.
 	if n.Descriptor.NodeID != 0 {
 		nodeIDKey := gossip.MakeNodeIDGossipKey(n.Descriptor.NodeID)
 		if err := n.gossip.AddInfo(nodeIDKey, n.Descriptor.Address, ttlNodeIDGossip); err != nil {
-			glog.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
+			log.Errorf("couldn't gossip address for node %d: %v", n.Descriptor.NodeID, err)
 		}
 	}
 }
@@ -382,100 +369,131 @@ func (n *Node) startGossip() {
 // gossipCapacities calls capacity on each store and adds it to the
 // gossip network.
 func (n *Node) gossipCapacities() {
-	n.localDB.VisitStores(func(s *storage.Store) error {
+	n.lSender.VisitStores(func(s *storage.Store) error {
 		storeDesc, err := s.Descriptor(&n.Descriptor)
 		if err != nil {
-			glog.Warningf("problem getting store descriptor for store %+v: %v", s.Ident, err)
+			log.Warningf("problem getting store descriptor for store %+v: %v", s.Ident, err)
 			return nil
 		}
-		gossipPrefix := gossip.KeyMaxAvailCapacityPrefix + storeDesc.CombinedAttrs().SortedString()
-		keyMaxCapacity := gossipPrefix + strconv.FormatInt(int64(storeDesc.Node.NodeID), 10) + "-" +
+		// Unique gossip key per store.
+		keyMaxCapacity := gossip.KeyMaxAvailCapacityPrefix +
+			strconv.FormatInt(int64(storeDesc.Node.NodeID), 10) + "-" +
 			strconv.FormatInt(int64(storeDesc.StoreID), 10)
-		// Register gossip group.
-		n.gossip.RegisterGroup(gossipPrefix, gossipGroupLimit, gossip.MaxGroup)
 		// Gossip store descriptor.
 		n.gossip.AddInfo(keyMaxCapacity, *storeDesc, ttlCapacityGossip)
 		return nil
 	})
 }
 
-// executeCmd looks up the store specified by header.Replica, and runs
-// Store.ExecuteCmd.
-func (n *Node) executeCmd(method string, header *storage.RequestHeader, args, reply interface{}) error {
-	store, err := n.localDB.GetStore(&header.Replica)
-	if err != nil {
-		return err
+// executeCmd creates a client.Call struct and sends if via our local sender.
+func (n *Node) executeCmd(method string, args proto.Request, reply proto.Response) error {
+	call := &client.Call{
+		Method: method,
+		Args:   args,
+		Reply:  reply,
 	}
-	store.ExecuteCmd(method, header, args, reply)
+	n.lSender.Send(call)
 	return nil
 }
 
+// TODO(spencer): fill in method comments below.
+
 // Contains .
-func (n *Node) Contains(args *storage.ContainsRequest, reply *storage.ContainsResponse) error {
-	return n.executeCmd(storage.Contains, &args.RequestHeader, args, reply)
+func (n *Node) Contains(args *proto.ContainsRequest, reply *proto.ContainsResponse) error {
+	return n.executeCmd(proto.Contains, args, reply)
 }
 
 // Get .
-func (n *Node) Get(args *storage.GetRequest, reply *storage.GetResponse) error {
-	return n.executeCmd(storage.Get, &args.RequestHeader, args, reply)
+func (n *Node) Get(args *proto.GetRequest, reply *proto.GetResponse) error {
+	return n.executeCmd(proto.Get, args, reply)
 }
 
 // Put .
-func (n *Node) Put(args *storage.PutRequest, reply *storage.PutResponse) error {
-	return n.executeCmd(storage.Put, &args.RequestHeader, args, reply)
+func (n *Node) Put(args *proto.PutRequest, reply *proto.PutResponse) error {
+	return n.executeCmd(proto.Put, args, reply)
 }
 
 // ConditionalPut .
-func (n *Node) ConditionalPut(args *storage.ConditionalPutRequest, reply *storage.ConditionalPutResponse) error {
-	return n.executeCmd(storage.ConditionalPut, &args.RequestHeader, args, reply)
+func (n *Node) ConditionalPut(args *proto.ConditionalPutRequest, reply *proto.ConditionalPutResponse) error {
+	return n.executeCmd(proto.ConditionalPut, args, reply)
 }
 
 // Increment .
-func (n *Node) Increment(args *storage.IncrementRequest, reply *storage.IncrementResponse) error {
-	return n.executeCmd(storage.Increment, &args.RequestHeader, args, reply)
+func (n *Node) Increment(args *proto.IncrementRequest, reply *proto.IncrementResponse) error {
+	return n.executeCmd(proto.Increment, args, reply)
 }
 
 // Delete .
-func (n *Node) Delete(args *storage.DeleteRequest, reply *storage.DeleteResponse) error {
-	return n.executeCmd(storage.Delete, &args.RequestHeader, args, reply)
+func (n *Node) Delete(args *proto.DeleteRequest, reply *proto.DeleteResponse) error {
+	return n.executeCmd(proto.Delete, args, reply)
 }
 
 // DeleteRange .
-func (n *Node) DeleteRange(args *storage.DeleteRangeRequest, reply *storage.DeleteRangeResponse) error {
-	return n.executeCmd(storage.DeleteRange, &args.RequestHeader, args, reply)
+func (n *Node) DeleteRange(args *proto.DeleteRangeRequest, reply *proto.DeleteRangeResponse) error {
+	return n.executeCmd(proto.DeleteRange, args, reply)
 }
 
 // Scan .
-func (n *Node) Scan(args *storage.ScanRequest, reply *storage.ScanResponse) error {
-	return n.executeCmd(storage.Scan, &args.RequestHeader, args, reply)
+func (n *Node) Scan(args *proto.ScanRequest, reply *proto.ScanResponse) error {
+	return n.executeCmd(proto.Scan, args, reply)
 }
 
 // EndTransaction .
-func (n *Node) EndTransaction(args *storage.EndTransactionRequest, reply *storage.EndTransactionResponse) error {
-	return n.executeCmd(storage.EndTransaction, &args.RequestHeader, args, reply)
-}
-
-// AccumulateTS .
-func (n *Node) AccumulateTS(args *storage.AccumulateTSRequest, reply *storage.AccumulateTSResponse) error {
-	return n.executeCmd(storage.AccumulateTS, &args.RequestHeader, args, reply)
+func (n *Node) EndTransaction(args *proto.EndTransactionRequest, reply *proto.EndTransactionResponse) error {
+	return n.executeCmd(proto.EndTransaction, args, reply)
 }
 
 // ReapQueue .
-func (n *Node) ReapQueue(args *storage.ReapQueueRequest, reply *storage.ReapQueueResponse) error {
-	return n.executeCmd(storage.ReapQueue, &args.RequestHeader, args, reply)
+func (n *Node) ReapQueue(args *proto.ReapQueueRequest, reply *proto.ReapQueueResponse) error {
+	return n.executeCmd(proto.ReapQueue, args, reply)
 }
 
 // EnqueueUpdate .
-func (n *Node) EnqueueUpdate(args *storage.EnqueueUpdateRequest, reply *storage.EnqueueUpdateResponse) error {
-	return n.executeCmd(storage.EnqueueUpdate, &args.RequestHeader, args, reply)
+func (n *Node) EnqueueUpdate(args *proto.EnqueueUpdateRequest, reply *proto.EnqueueUpdateResponse) error {
+	return n.executeCmd(proto.EnqueueUpdate, args, reply)
 }
 
 // EnqueueMessage .
-func (n *Node) EnqueueMessage(args *storage.EnqueueMessageRequest, reply *storage.EnqueueMessageResponse) error {
-	return n.executeCmd(storage.EnqueueMessage, &args.RequestHeader, args, reply)
+func (n *Node) EnqueueMessage(args *proto.EnqueueMessageRequest, reply *proto.EnqueueMessageResponse) error {
+	return n.executeCmd(proto.EnqueueMessage, args, reply)
+}
+
+// AdminSplit .
+func (n *Node) AdminSplit(args *proto.AdminSplitRequest, reply *proto.AdminSplitResponse) error {
+	return n.executeCmd(proto.AdminSplit, args, reply)
 }
 
 // InternalRangeLookup .
-func (n *Node) InternalRangeLookup(args *storage.InternalRangeLookupRequest, reply *storage.InternalRangeLookupResponse) error {
-	return n.executeCmd(storage.InternalRangeLookup, &args.RequestHeader, args, reply)
+func (n *Node) InternalRangeLookup(args *proto.InternalRangeLookupRequest, reply *proto.InternalRangeLookupResponse) error {
+	return n.executeCmd(proto.InternalRangeLookup, args, reply)
+}
+
+// InternalHeartbeatTxn .
+func (n *Node) InternalHeartbeatTxn(args *proto.InternalHeartbeatTxnRequest, reply *proto.InternalHeartbeatTxnResponse) error {
+	return n.executeCmd(proto.InternalHeartbeatTxn, args, reply)
+}
+
+// InternalGC .
+func (n *Node) InternalGC(args *proto.InternalGCRequest, reply *proto.InternalGCResponse) error {
+	return n.executeCmd(proto.InternalGC, args, reply)
+}
+
+// InternalPushTxn .
+func (n *Node) InternalPushTxn(args *proto.InternalPushTxnRequest, reply *proto.InternalPushTxnResponse) error {
+	return n.executeCmd(proto.InternalPushTxn, args, reply)
+}
+
+// InternalResolveIntent .
+func (n *Node) InternalResolveIntent(args *proto.InternalResolveIntentRequest, reply *proto.InternalResolveIntentResponse) error {
+	return n.executeCmd(proto.InternalResolveIntent, args, reply)
+}
+
+// InternalMerge .
+func (n *Node) InternalMerge(args *proto.InternalMergeRequest, reply *proto.InternalMergeResponse) error {
+	return n.executeCmd(proto.InternalMerge, args, reply)
+}
+
+// InternalTruncateLog .
+func (n *Node) InternalTruncateLog(args *proto.InternalTruncateLogRequest, reply *proto.InternalTruncateLogResponse) error {
+	return n.executeCmd(proto.InternalTruncateLog, args, reply)
 }

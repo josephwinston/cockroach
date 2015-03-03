@@ -9,20 +9,27 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
+//
+// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package main
 
 import (
 	"flag"
+	"fmt"
+	"math/rand"
 	"os"
 	"runtime"
+	"strings"
+	"text/tabwriter"
 
 	commander "code.google.com/p/go-commander"
-	"github.com/cockroachdb/cockroach/server"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/server/cli"
+	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 func init() {
@@ -48,18 +55,19 @@ func main() {
 	// production workloads.
 	numCPU := runtime.NumCPU()
 	runtime.GOMAXPROCS(numCPU)
-	glog.V(1).Infof("running using %d processor cores", numCPU)
+	rand.Seed(util.NewPseudoSeed())
+	log.V(1).Infof("running using %d processor cores", numCPU)
 
 	c := commander.Commander{
 		Name: "cockroach",
 		Commands: []*commander.Command{
-			server.CmdInit,
-			server.CmdGetZone,
-			server.CmdLsZones,
-			server.CmdRmZone,
-			server.CmdSetZone,
-			server.CmdStart,
-			&commander.Command{
+			cli.CmdInit,
+			cli.CmdGetZone,
+			cli.CmdLsZones,
+			cli.CmdRmZone,
+			cli.CmdSetZone,
+			cli.CmdStart,
+			{
 				UsageLine: "listparams",
 				Short:     "list all available parameters and their default values",
 				Long: `
@@ -73,14 +81,33 @@ to precede any additional arguments,
 					flag.CommandLine.PrintDefaults()
 				},
 			},
+			{
+				UsageLine: "version",
+				Short:     "output version information",
+				Long: `
+Output build version information.
+`,
+				Run: func(cmd *commander.Command, args []string) {
+					info := util.GetBuildInfo()
+					w := &tabwriter.Writer{}
+					w.Init(os.Stdout, 2, 1, 2, ' ', 0)
+					fmt.Fprintf(w, "Build SHA:   %s\n", info.SHA)
+					fmt.Fprintf(w, "Build Tag:   %s\n", info.Tag)
+					fmt.Fprintf(w, "Build Time:  %s\n", info.Time)
+					fmt.Fprintf(w, "Build Deps:\n\t%s\n",
+						strings.Replace(strings.Replace(info.Deps, " ", "\n\t", -1), ":", "\t", -1))
+					w.Flush()
+				},
+			},
 		},
 	}
+
+	cli.InitFlags(cli.Context)
 
 	if len(os.Args) == 1 {
 		os.Args = append(os.Args, "help")
 	}
 	if err := c.Run(os.Args[1:]); err != nil {
-		glog.Errorf("Failed running command \"%s\": %v\n", os.Args[1:], err)
-		os.Exit(1)
+		log.Fatalf("Failed running command %q: %v\n", os.Args[1:], err)
 	}
 }

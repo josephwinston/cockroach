@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -18,83 +18,84 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
 
-	"github.com/cockroachdb/cockroach/storage"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/storage/engine"
+	yaml "gopkg.in/yaml.v1"
 )
 
-const (
-	testConfig = `
+const testZoneConfig = `
 replicas:
-  - [dc1, ssd]
+  - attrs: [dc1, ssd]
+  - attrs: [dc2, ssd]
+  - attrs: [dc3, ssd]
 range_min_bytes: 1048576
 range_max_bytes: 67108864
 `
-)
-
-// createTestConfigFile creates a temporary file and writes the
-// testConfig yaml data to it. The caller is responsible for
-// removing it. Returns the filename for a subsequent call to
-// os.Remove().
-func createTestConfigFile() string {
-	f, err := ioutil.TempFile("", "test-config")
-	if err != nil {
-		glog.Fatalf("failed to open temporary file: %v", err)
-	}
-	defer f.Close()
-	f.Write([]byte(testConfig))
-	return f.Name()
-}
 
 // ExampleSetAndGetZone sets zone configs for a variety of key
 // prefixes and verifies they can be fetched directly.
 func ExampleSetAndGetZone() {
 	httpServer := startAdminServer()
 	defer httpServer.Close()
-	testConfigFn := createTestConfigFile()
+	testConfigFn := createTestConfigFile(testZoneConfig)
 	defer os.Remove(testConfigFn)
 
 	testData := []struct {
-		prefix storage.Key
+		prefix proto.Key
 		yaml   string
 	}{
-		{storage.KeyMin, testConfig},
-		{storage.Key("db1"), testConfig},
-		{storage.Key("db 2"), testConfig},
-		{storage.Key("\xfe"), testConfig},
+		{engine.KeyMin, testZoneConfig},
+		{proto.Key("db1"), testZoneConfig},
+		{proto.Key("db 2"), testZoneConfig},
+		{proto.Key("\xfe"), testZoneConfig},
 	}
 
 	for _, test := range testData {
 		prefix := url.QueryEscape(string(test.prefix))
-		runSetZone(CmdSetZone, []string{prefix, testConfigFn})
-		runGetZones(CmdGetZone, []string{prefix})
+		RunSetZone(testContext, prefix, testConfigFn)
+		RunGetZone(testContext, prefix)
 	}
 	// Output:
 	// set zone config for key prefix ""
 	// zone config for key prefix "":
-	// replicas: [[dc1, ssd]]
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
-
+	//
 	// set zone config for key prefix "db1"
 	// zone config for key prefix "db1":
-	// replicas: [[dc1, ssd]]
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
-
+	//
 	// set zone config for key prefix "db+2"
 	// zone config for key prefix "db+2":
-	// replicas: [[dc1, ssd]]
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
-
+	//
 	// set zone config for key prefix "%FE"
 	// zone config for key prefix "%FE":
-	// replicas: [[dc1, ssd]]
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
 	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 }
@@ -105,15 +106,15 @@ func ExampleSetAndGetZone() {
 func ExampleLsZones() {
 	httpServer := startAdminServer()
 	defer httpServer.Close()
-	testConfigFn := createTestConfigFile()
+	testConfigFn := createTestConfigFile(testZoneConfig)
 	defer os.Remove(testConfigFn)
 
-	keys := []storage.Key{
-		storage.KeyMin,
-		storage.Key("db1"),
-		storage.Key("db2"),
-		storage.Key("db3"),
-		storage.Key("user"),
+	keys := []proto.Key{
+		engine.KeyMin,
+		proto.Key("db1"),
+		proto.Key("db2"),
+		proto.Key("db3"),
+		proto.Key("user"),
 	}
 
 	regexps := []string{
@@ -124,15 +125,15 @@ func ExampleLsZones() {
 
 	for _, key := range keys {
 		prefix := url.QueryEscape(string(key))
-		runSetZone(CmdSetZone, []string{prefix, testConfigFn})
+		RunSetZone(testContext, prefix, testConfigFn)
 	}
 
 	for i, regexp := range regexps {
 		fmt.Fprintf(os.Stdout, "test case %d: %q\n", i, regexp)
 		if regexp == "" {
-			runLsZones(CmdLsZones, []string{})
+			RunLsZone(testContext, "")
 		} else {
-			runLsZones(CmdLsZones, []string{regexp})
+			RunLsZone(testContext, regexp)
 		}
 	}
 	// Output:
@@ -163,23 +164,23 @@ func ExampleLsZones() {
 func ExampleRmZones() {
 	httpServer := startAdminServer()
 	defer httpServer.Close()
-	testConfigFn := createTestConfigFile()
+	testConfigFn := createTestConfigFile(testZoneConfig)
 	defer os.Remove(testConfigFn)
 
-	keys := []storage.Key{
-		storage.KeyMin,
-		storage.Key("db1"),
+	keys := []proto.Key{
+		engine.KeyMin,
+		proto.Key("db1"),
 	}
 
 	for _, key := range keys {
 		prefix := url.QueryEscape(string(key))
-		runSetZone(CmdSetZone, []string{prefix, testConfigFn})
+		RunSetZone(testContext, prefix, testConfigFn)
 	}
 
 	for _, key := range keys {
 		prefix := url.QueryEscape(string(key))
-		runRmZone(CmdRmZone, []string{prefix})
-		runLsZones(CmdLsZones, []string{})
+		RunRmZone(testContext, prefix)
+		RunLsZone(testContext, "")
 	}
 	// Output:
 	// set zone config for key prefix ""
@@ -188,4 +189,114 @@ func ExampleRmZones() {
 	// db1
 	// removed zone config for key prefix "db1"
 	// [default]
+}
+
+// ExampleZoneContentTypes verifies that the Accept header can be used
+// to control the format of the response and the Content-Type header
+// can be used to specify the format of the request.
+func ExampleZoneContentTypes() {
+	httpServer := startAdminServer()
+	defer httpServer.Close()
+
+	config := &proto.ZoneConfig{}
+	err := yaml.Unmarshal([]byte(testZoneConfig), config)
+	if err != nil {
+		fmt.Println(err)
+	}
+	testCases := []struct {
+		contentType, accept string
+	}{
+		{"application/json", "application/json"},
+		{"text/yaml", "application/json"},
+		{"application/json", "text/yaml"},
+		{"text/yaml", "text/yaml"},
+	}
+	for i, test := range testCases {
+		key := fmt.Sprintf("/test%d", i)
+
+		var body []byte
+		if test.contentType == "application/json" {
+			if body, err = json.MarshalIndent(config, "", "  "); err != nil {
+				fmt.Println(err)
+			}
+		} else {
+			if body, err = yaml.Marshal(config); err != nil {
+				fmt.Println(err)
+			}
+		}
+		req, err := http.NewRequest("POST", fmt.Sprintf("%s://%s%s%s", adminScheme, testContext.Addr, zonePathPrefix, key), bytes.NewReader(body))
+		req.Header.Add("Content-Type", test.contentType)
+		if _, err = sendAdminRequest(req); err != nil {
+			fmt.Println(err)
+		}
+
+		req, err = http.NewRequest("GET", fmt.Sprintf("%s://%s%s%s", adminScheme, testContext.Addr, zonePathPrefix, key), nil)
+		req.Header.Add("Accept", test.accept)
+		if body, err = sendAdminRequest(req); err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(string(body))
+	}
+	// Output:
+	// {
+	//   "replica_attrs": [
+	//     {
+	//       "attrs": [
+	//         "dc1",
+	//         "ssd"
+	//       ]
+	//     },
+	//     {
+	//       "attrs": [
+	//         "dc2",
+	//         "ssd"
+	//       ]
+	//     },
+	//     {
+	//       "attrs": [
+	//         "dc3",
+	//         "ssd"
+	//       ]
+	//     }
+	//   ],
+	//   "range_min_bytes": 1048576,
+	//   "range_max_bytes": 67108864
+	// }
+	// {
+	//   "replica_attrs": [
+	//     {
+	//       "attrs": [
+	//         "dc1",
+	//         "ssd"
+	//       ]
+	//     },
+	//     {
+	//       "attrs": [
+	//         "dc2",
+	//         "ssd"
+	//       ]
+	//     },
+	//     {
+	//       "attrs": [
+	//         "dc3",
+	//         "ssd"
+	//       ]
+	//     }
+	//   ],
+	//   "range_min_bytes": 1048576,
+	//   "range_max_bytes": 67108864
+	// }
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
+	// range_min_bytes: 1048576
+	// range_max_bytes: 67108864
+	//
+	// replicas:
+	// - attrs: [dc1, ssd]
+	// - attrs: [dc2, ssd]
+	// - attrs: [dc3, ssd]
+	// range_min_bytes: 1048576
+	// range_max_bytes: 67108864
 }

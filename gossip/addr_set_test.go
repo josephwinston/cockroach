@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -18,7 +18,6 @@
 package gossip
 
 import (
-	"fmt"
 	"net"
 	"testing"
 )
@@ -31,29 +30,6 @@ func TestMaxSize(t *testing.T) {
 	addrs.addAddr(emptyAddr)
 	if addrs.hasSpace() {
 		t.Error("set should have no space")
-	}
-}
-
-func TestSelectRandom(t *testing.T) {
-	const numAddrs = 10
-	addrs := newAddrSet(numAddrs)
-	found := make(map[string]bool)
-	for i := 0; i < numAddrs; i++ {
-		addrs.addAddr(testAddr(fmt.Sprintf("<test-addr:%d>", i)))
-	}
-
-	// Select randomly until we've found all addresses.
-	var count int
-	for count = 0; true; count++ {
-		if len(found) == numAddrs {
-			break
-		}
-		found[addrs.selectRandom().String()] = true
-	}
-
-	// With default test random seed, we select 41 times for 10 addresses.
-	if count == numAddrs {
-		t.Errorf("expected > %d attempts to randomly select all addresses", numAddrs)
 	}
 }
 

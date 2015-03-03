@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -21,11 +21,9 @@ package storage
 import (
 	"math/rand"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util"
 )
-
-// StoreFinder finds the disks in a datacenter with the most available capacity.
-type StoreFinder func(Attributes) ([]*StoreDescriptor, error)
 
 // allocator makes allocation decisions based on a zone configuration,
 // existing range metadata and available stores. Configuration
@@ -33,7 +31,7 @@ type StoreFinder func(Attributes) ([]*StoreDescriptor, error)
 // engine-backed range they describe. Information on suitability and
 // availability of servers is gleaned from the gossip network.
 type allocator struct {
-	storeFinder StoreFinder
+	storeFinder FindStoreFunc
 	rand        rand.Rand
 }
 
@@ -42,10 +40,10 @@ type allocator struct {
 // error. It uses the allocator's StoreFinder to select the set of
 // available stores matching attributes for missing replicas and picks
 // using randomly weighted selection based on available capacities.
-func (a *allocator) allocate(required Attributes, existingReplicas []Replica) (
+func (a *allocator) allocate(required proto.Attributes, existingReplicas []proto.Replica) (
 	*StoreDescriptor, error) {
 	// Get a set of current nodes -- we never want to allocate on an existing node.
-	usedNodes := make(map[int32]struct{})
+	usedNodes := make(map[proto.NodeID]struct{})
 	for _, replica := range existingReplicas {
 		usedNodes[replica.NodeID] = struct{}{}
 	}

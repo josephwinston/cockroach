@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -56,7 +56,7 @@ the system with minimal total hops. The algorithm is as follows:
 package gossip
 
 import (
-	"flag"
+	"encoding/json"
 	"math"
 	"net"
 	"strings"
@@ -65,20 +65,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
-)
-
-var (
-	// GossipBootstrap is a comma-separated list of node addresses which
-	// active as bootstrap hosts for connecting to the gossip network.
-	GossipBootstrap = flag.String(
-		"gossip", "",
-		"addresses (comma-separated host:port pairs) of node addresses for gossip bootstrap")
-	// GossipInterval is a time interval specifying how often gossip is
-	// communicated between hosts on the gossip network.
-	GossipInterval = flag.Duration(
-		"gossip_interval", 2*time.Second,
-		"approximate interval (time.Duration) for gossiping new information to peers")
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 const (
@@ -97,6 +85,12 @@ const (
 	// Once we receive the gossip with actual count, the default count
 	// is replaced.
 	defaultNodeCount = 1000
+
+	// TestInterval is the default gossip interval used for running tests.
+	TestInterval = 10 * time.Millisecond
+
+	// TestBootstrap is the default gossip bootstrap used for running tests.
+	TestBootstrap = ""
 )
 
 // Gossip is an instance of a gossip node. It embeds a gossip server.
@@ -107,6 +101,7 @@ type Gossip struct {
 	Connected    chan struct{}      // Closed upon initial connection
 	hasConnected bool               // Set first time network is connected
 	isBootstrap  bool               // True if this node is a bootstrap host
+	RPCContext   *rpc.Context       // The context required for RPC
 	*server                         // Embedded gossip RPC server
 	bootstraps   *addrSet           // Bootstrap host addresses
 	outgoing     *addrSet           // Set of outgoing client addresses
@@ -115,17 +110,30 @@ type Gossip struct {
 	disconnected chan *client       // Channel of disconnected clients
 	exited       chan error         // Channel to signal exit
 	stalled      *sync.Cond         // Indicates bootstrap is required
+	clock        *hlc.Clock         // The server hlc clock.
+
+	// GossipInterval is a time interval specifying how often gossip is
+	// communicated between hosts on the gossip network.
+	gossipInterval time.Duration
+
+	// GossipBootstrap is a comma-separated list of node addresses that
+	// act as bootstrap hosts for connecting to the gossip network.
+	gossipBootstrap string
 }
 
 // New creates an instance of a gossip node.
-func New() *Gossip {
+func New(rpcContext *rpc.Context, gossipInterval time.Duration, gossipBootstrap string) *Gossip {
 	g := &Gossip{
 		Connected:    make(chan struct{}),
-		server:       newServer(*GossipInterval),
+		RPCContext:   rpcContext,
+		server:       newServer(gossipInterval),
 		bootstraps:   newAddrSet(MaxPeers),
 		outgoing:     newAddrSet(MaxPeers),
 		clients:      map[string]*client{},
 		disconnected: make(chan *client, MaxPeers),
+
+		gossipInterval:  gossipInterval,
+		gossipBootstrap: gossipBootstrap,
 	}
 	g.stalled = sync.NewCond(&g.mu)
 	return g
@@ -172,6 +180,14 @@ func (g *Gossip) GetInfo(key string) (interface{}, error) {
 	return nil, util.Errorf("key %q does not exist or has expired", key)
 }
 
+// GetInfosAsJSON returns the contents of the infostore, marshalled to
+// JSON.
+func (g *Gossip) GetInfosAsJSON() ([]byte, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return json.Marshal(g.is)
+}
+
 // GetGroupInfos returns a slice of info values from specified group,
 // or an error if group is not registered.
 func (g *Gossip) GetGroupInfos(prefix string) ([]interface{}, error) {
@@ -191,9 +207,25 @@ func (g *Gossip) GetGroupInfos(prefix string) ([]interface{}, error) {
 // RegisterGroup registers a new group with info store. Returns an
 // error if the group was already registered.
 func (g *Gossip) RegisterGroup(prefix string, limit int, typeOf GroupType) error {
-	g.mu.Lock() // Copyright 2014 The Cockroach Authors.
+	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.is.registerGroup(newGroup(prefix, limit, typeOf))
+}
+
+// Callback is a callback method to be invoked on gossip update
+// of info denoted by key. The contentsChanged bool indicates whether
+// the info contents were updated. False indicates the info timestamp
+// was refreshed, but its contents remained unchanged.
+type Callback func(key string, contentsChanged bool)
+
+// RegisterCallback registers a callback for a key pattern to be
+// invoked whenever new info for a gossip key matching pattern is
+// received. The callback method is invoked with the info key which
+// matched pattern.
+func (g *Gossip) RegisterCallback(pattern string, method Callback) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.is.registerCallback(pattern, method)
 }
 
 // MaxHops returns the maximum number of hops to reach the furthest
@@ -246,9 +278,11 @@ func (g *Gossip) Stop() <-chan error {
 	// Wake up bootstrap goroutine so it can exit.
 	g.stalled.Signal()
 	// Close all outgoing clients.
+	g.mu.Lock()
 	for _, addr := range g.outgoing.asSlice() {
 		g.closeClient(addr)
 	}
+	g.mu.Unlock()
 	return g.exited
 }
 
@@ -276,23 +310,23 @@ func (g *Gossip) hasIncoming(addr net.Addr) bool {
 // parseBootstrapAddresses parses the gossip bootstrap addresses
 // passed via -gossip command line flag.
 func (g *Gossip) parseBootstrapAddresses() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if *GossipBootstrap != "" {
-		addresses := strings.Split(*GossipBootstrap, ",")
-		for _, addr := range addresses {
-			addr = strings.TrimSpace(addr)
-			tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
-			if err != nil {
-				glog.Errorf("invalid gossip bootstrap address %s: %s", addr, err)
-				continue
-			}
-			g.bootstraps.addAddr(tcpAddr)
+	addresses := strings.Split(g.gossipBootstrap, ",")
+	for _, addr := range addresses {
+		addr = strings.TrimSpace(addr)
+		if len(addr) == 0 {
+			continue
 		}
+		_, err := net.ResolveTCPAddr("tcp", addr)
+		if err != nil {
+			log.Errorf("invalid gossip bootstrap address %s: %s", addr, err)
+			continue
+		}
+		g.bootstraps.addAddr(util.MakeRawAddr("tcp", addr))
 	}
+
 	// If we have no bootstrap hosts, fatal exit.
-	if g.bootstraps.len() == 0 {
-		glog.Fatalf("no hosts specified for gossip network (use -gossip)")
+	if len(addresses) == 0 && g.bootstraps.len() == 0 {
+		log.Fatalf("no hosts specified for gossip network (use -gossip)")
 	}
 	// Remove our own node address.
 	if g.bootstraps.hasAddr(g.is.NodeAddr) {
@@ -321,9 +355,9 @@ func (g *Gossip) filterExtant(addrs *addrSet) *addrSet {
 //
 // This method will block and should be run via goroutine.
 func (g *Gossip) bootstrap() {
-	g.parseBootstrapAddresses()
 	for {
 		g.mu.Lock()
+		g.parseBootstrapAddresses()
 		if g.closed {
 			break
 		}
@@ -336,7 +370,7 @@ func (g *Gossip) bootstrap() {
 			if !haveClients || !haveSentinel {
 				// Select a bootstrap address at random and start client.
 				addr := avail.selectRandom()
-				glog.Infof("bootstrapping gossip protocol using host %+v", addr)
+				log.Infof("bootstrapping gossip protocol using host %+v", addr)
 				g.startClient(addr)
 			}
 		}
@@ -365,7 +399,7 @@ func (g *Gossip) manage() {
 		case c := <-g.disconnected:
 			g.mu.Lock()
 			if c.err != nil {
-				glog.Infof("client disconnected: %s", c.err)
+				log.Infof("client disconnected: %s", c.err)
 			}
 			g.outgoing.removeAddr(c.addr)
 
@@ -393,7 +427,7 @@ func (g *Gossip) manage() {
 					// connected.
 					addr := g.is.leastUseful(g.outgoing)
 					if addr != nil {
-						glog.Infof("closing least useful client %+v to tighten network graph", addr)
+						log.Infof("closing least useful client %+v to tighten network graph", addr)
 						g.closeClient(addr)
 					}
 				}
@@ -404,12 +438,12 @@ func (g *Gossip) manage() {
 		// and there are still unused bootstrap hosts, signal bootstrapper
 		// to try another.
 		hasSentinel := g.is.getInfo(KeySentinel) != nil
-		if g.filterExtant(g.bootstraps).len() > 0 {
+		if g.filterExtant(g.bootstraps).len() > 0 || (g.bootstraps.len() == 0 && len(g.gossipBootstrap) > 0) {
 			if g.outgoing.len()+g.incoming.len() == 0 {
-				glog.Infof("no connections; signaling bootstrap")
+				log.Infof("no connections; signaling bootstrap")
 				g.stalled.Signal()
 			} else if !hasSentinel {
-				glog.Warningf("missing sentinel gossip %s; assuming partition and reconnecting", KeySentinel)
+				log.Warningf("missing sentinel gossip %s; assuming partition and reconnecting", KeySentinel)
 				g.stalled.Signal()
 			}
 		}
@@ -444,22 +478,22 @@ func (g *Gossip) maybeWarnAboutInit() {
 		Constant:    2,                // doubles
 		MaxAttempts: 0,                // indefinite retries
 	}
-	util.RetryWithBackoff(retryOptions, func() (bool, error) {
+	util.RetryWithBackoff(retryOptions, func() (util.RetryStatus, error) {
 		g.mu.Lock()
 		hasSentinel := g.is.getInfo(KeySentinel) != nil
 		allConnected := g.filterExtant(g.bootstraps).len() == 0
 		g.mu.Unlock()
 		// If we have the sentinel, exit the retry loop.
 		if hasSentinel {
-			return true, nil
+			return util.RetryBreak, nil
 		}
 		// Otherwise, if all bootstrap hosts are connected and this
 		// node is a bootstrap host, warn.
 		if allConnected && g.isBootstrap {
-			glog.Warningf("connected to gossip but missing sentinel. Has the cluster been initialized? " +
+			log.Warningf("connected to gossip but missing sentinel. Has the cluster been initialized? " +
 				"Use \"cockroach init\" to initialize.")
 		}
-		return false, nil
+		return util.RetryContinue, nil
 	})
 }
 

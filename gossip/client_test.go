@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -23,26 +23,38 @@ import (
 
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
-func init() {
+const (
 	// With the default gossip interval, some tests
 	// may take longer than they need.
-	*GossipInterval = 20 * time.Millisecond
-}
+	gossipInterval  = 20 * time.Millisecond
+	gossipBootstrap = ""
+)
 
 // startGossip creates local and remote gossip instances.
 // The remote gossip instance launches its gossip service.
 func startGossip(t *testing.T) (local, remote *Gossip, lserver, rserver *rpc.Server) {
+	tlsConfig := rpc.LoadInsecureTLSConfig()
+	lclock := hlc.NewClock(hlc.UnixNano)
+	lRPCContext := rpc.NewContext(lclock, tlsConfig)
+
 	laddr := util.CreateTestAddr("unix")
-	lserver = rpc.NewServer(laddr)
-	lserver.Start()
-	local = New()
+	lserver = rpc.NewServer(laddr, lRPCContext)
+	if err := lserver.Start(); err != nil {
+		t.Fatal(err)
+	}
+	local = New(lRPCContext, gossipInterval, gossipBootstrap)
+	rclock := hlc.NewClock(hlc.UnixNano)
 	raddr := util.CreateTestAddr("unix")
-	rserver = rpc.NewServer(raddr)
-	rserver.Start()
-	remote = New()
+	rRPCContext := rpc.NewContext(rclock, tlsConfig)
+	rserver = rpc.NewServer(raddr, rRPCContext)
+	if err := rserver.Start(); err != nil {
+		t.Fatal(err)
+	}
+	remote = New(rRPCContext, gossipInterval, gossipBootstrap)
 	local.start(lserver)
 	remote.start(rserver)
 	time.Sleep(time.Millisecond)
@@ -71,7 +83,7 @@ func TestClientGossip(t *testing.T) {
 	local.stop()
 	lserver.Close()
 	rserver.Close()
-	glog.Info("done serving")
+	log.Info("done serving")
 	if client != <-disconnected {
 		t.Errorf("expected client disconnect after remote close")
 	}

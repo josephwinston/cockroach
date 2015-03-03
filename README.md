@@ -1,28 +1,96 @@
-<img style="float: right" src="/resources/doc/color_cockroach.png?raw=true"/>
+# Cockroach [![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg)
 
-# Cockroach [![Build Status](https://secure.travis-ci.org/cockroachdb/cockroach.png)](http://travis-ci.org/cockroachdb/cockroach)  [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg) 
+## A Scalable, Geo-Replicated, Transactional Datastore
 
-A Scalable, Geo-Replicated, Transactional Datastore
+<img align="right" src="/resources/doc/color_cockroach.png?raw=true"/>
+
+**Table of Contents**
+
+- [Status](#status)
+- [Running Cockroach](#running-cockroach)
+- [Get in touch](#get-in-touch)
+- [Contributing](#contributing)
+- [Design](#design) and [Datastore Goal Articulation](#datastore-goal-articulation)
+- [Architecture](#architecture) and [Client Architecture](#client-architecture)
+
+[![WIRED on CockroachDB](/resources/doc/wired-preview.png?raw=true)](http://www.wired.com/2014/07/cockroachdb/)
 
 ## Status
 
 **ALPHA**
 
 * Gossip network
+* Distributed transactions
 * Cluster initialization and joining
 * Basic Key-Value REST API
-* NO: Raft consensus, range splitting, transactions (!)
+* Range splitting
 
-## Simple Setup
+**Next Steps**
 
-* node1> ./cockroach init hdd=\<path>
-* node1> ./cockroach start -gossip=:8081 -rpc_addr=:8081 -http_adr=:8080 -stores=hdd=\<path>
+* Raft consensus
+* Rebalancing
 
-* node2> ./cockroach start -gossip=node1:8081 -http_adr=:8080 -stores=hdd=\<path>
+See [TODO.md](https://github.com/cockroachdb/cockroach/blob/master/TODO.md)
 
-## Next Steps
+## Running Cockroach
 
-See [TODO](https://github.com/cockroachdb/cockroach/blob/master/TODO)
+Don't have (a recent version > 1.2 of) Docker? Follow the [instructions for installing Docker on your host system](http://docs.docker.com/installation/). If you run into trouble below, check first that you're not running an old version.
+
+If you don't want to use Docker,
+* set up the dev environment (see [CONTRIBUTING.md](CONTRIBUTING.md))
+* `make build`
+* replace `docker [...] [run|build] [...]` by `./cockroach` below.
+
+#### Bootstrap and talk to a single node
+
+```bash
+$ docker run -d -p 8080:8080 "cockroachdb/cockroach" \
+    init -rpc="localhost:0" \
+    -certs="resources/test_certs" \
+    -stores="ssd=/tmp/db"
+```
+This bootstraps and starts a single node with one temporary RocksDB instance at /tmp/db in the background (remove the `-d` flag if you want to see stdout).
+Now let's talk to this node. You can use the [REST Explorer at
+localhost:8080](http://localhost:8080) or talk directly to the API:
+```bash
+$ curl -X POST -d "Hello" http://localhost:8080/kv/rest/entry/Cockroach
+```
+```json
+{"header":{"timestamp":{"wall_time":1416616834949813367,"logical":0}}}
+```
+```bash
+$ curl http://localhost:8080/kv/rest/entry/Cockroach
+```
+```json
+{"header":{"timestamp":{"wall_time":1416616886486257568,"logical":0}},"value":{"bytes":"SGVsbG8=","timestamp":{"wall_time":1416616834949813367,"logical":0}}}
+```
+Note that `SGVsbG8=` equals `base64("Hello")`.
+
+Among other things, you can also scan a key range:
+```bash
+$ curl "http://localhost:8080/kv/rest/range/?start=Ca&end=Cozz&limit=10"
+```
+```json
+{"header":{"timestamp":{"wall_time":1416617120031733436,"logical":0}},"rows":[{"key":"Q29ja3JvYWNo","value":{"bytes":"SGVsbG8=","timestamp":{"wall_time":1416616834949813367,"logical":0}}}]}
+```
+Note that `Q29ja3JvYWNo` equals `base64("Cockroach")`.
+
+#### Local Cluster Setup
+
+*        (cd run; ./local-cluster.sh [start|stop])
+
+#### Building the Docker images yourself
+See [build/README.md](build/) for more information on the available Docker
+images `cockroachdb/cockroach` and `cockroachdb/cockroach-dev`.
+You can build both of these images yourself:
+
+* `cockroachdb/cockroach-dev`: `(cd build ; ./build-docker-dev.sh)`
+* `cockroachdb/cockroach`: `(cd build ; ./build-docker-deploy.sh)`
+  (this will build the first image as well)
+
+Once you've built your image, you may want to run the tests:
+* `docker run "cockroachdb/cockroach-dev" test`
+* `make acceptance`
 
 ## Get in touch
 
@@ -36,6 +104,11 @@ See [CONTRIBUTING.md](https://github.com/cockroachdb/cockroach/blob/master/CONTR
 ## Design
 
 For full design details, see the [original design doc](https://docs.google.com/document/d/11k2EmhLGSbViBvi6_zFEiKzuXxYF49ZuuDJLe6O8gBU/edit?usp=sharing).
+
+For a quick design overview, see the [Cockroach tech talk slides](https://docs.google.com/presentation/d/1e3TOxImRg6_nyMZspXvzb2u43D6gnS5422vAIN7J1n8/edit?usp=sharing)
+or watch a presentation of the tech talk
+* [at Yelp!](http://www.youtube.com/watch?v=MEAuFgsmND0&feature=youtu.be) by [Spencer Kimball](https://github.com/spencerkimball) (9/5/2014)
+* [at the NoSQL User Group Cologne](https://www.youtube.com/watch?v=jI3LiKhqN0E) by [Tobias Schottdorf](https://github.com/tschottdorf) (11/5/2014).
 
 Cockroach is a distributed key/value datastore which supports ACID
 transactional semantics and versioned values as first-class
@@ -100,6 +173,73 @@ communication between distributed system components.
 
 ![SQL - NoSQL - NewSQL Capabilities](/resources/doc/sql-nosql-newsql.png?raw=true)
 
+## Datastore Goal Articulation
+
+There are other important axes involved in data-stores which are less
+well understood and/or explained. There is lots of cross-dependency,
+but it's safe to segregate two more of them as (a) scan efficiency,
+and (b) read vs write optimization.
+
+#### Datastore Scan Efficiency Spectrum
+
+Scan efficiency refers to the number of IO ops required to scan a set
+of sorted adjacent rows matching a criteria. However, it's a
+complicated topic, because of the options (or lack of options) for
+controlling physical order in different systems.
+
+* Some designs either default to or only support "heap organized"
+  physical records (Oracle, MySQL, Postgres, SQLite, MongoDB). In this
+  design, a naive sorted-scan of an index involves one IO op per
+  record.
+* In these systems it's possible to "fully cover" a sorted-query in an
+  index with some write-amplification.
+* In some systems it's possible to put the primary record data in a
+  sorted btree instead of a heap-table (default in MySQL/Innodb,
+  option in Oracle).
+* Sorted-order LSM NoSQL could be considered index-organized-tables,
+  with efficient scans by the row-key. (HBase).
+* Some NoSQL is not optimized for sorted-order retrieval, because of
+  hash-bucketing, primarily based on the Dynamo design. (Cassandra,
+  Riak)
+
+![Datastore Scan Efficiency Spectrum](/resources/doc/scan-efficiency.png?raw=true)
+
+#### Read vs. Write Optimization Spectrum
+
+Read vs write optimization is a product of the underlying sorted-order
+data-structure used. Btrees are read-optimized. Hybrid write-deferred
+trees are a balance of read-and-write optimizations (shuttle-trees,
+fractal-trees, stratified-trees). LSM separates write-incorporation
+into a separate step, offering a tunable amount of read-to-write
+optimization. An "ideal" LSM at 0%-write-incorporation is a log, and
+at 100%-write-incorporation is a btree.
+
+The topic of LSM is confused by the fact that LSM is not an algorithm,
+but a design pattern, and usage of LSM is hindered by the lack of a
+de-facto optimal LSM design. LevelDB/RocksDB is one of the more
+practical LSM implementations, but it is far from optimal. Popular
+text-indicies like Lucene are non-general purpose instances of
+write-optimized LSM.
+
+Further, there is a dependency between access pattern
+(read-modify-write vs blind-write and write-fraction), cache-hitrate,
+and ideal sorted-order algorithm selection. At a certain
+write-fraction and read-cache-hitrate, systems achieve higher total
+throughput with write-optimized designs, at the cost of increased
+worst-case read latency. As either write-fraction or
+read-cache-hitrate approaches 1.0, write-optimized designs provide
+dramatically better sustained system throughput when record-sizes are
+small relative to IO sizes.
+
+Given this information, data-stores can be sliced by their
+sorted-order storage algorithm selection. Btree stores are
+read-optimized (Oracle, SQLServer, Postgres, SQLite2, MySQL, MongoDB,
+CouchDB), hybrid stores are read-optimized with better
+write-throughput (Tokutek MySQL/MongoDB), while LSM-variants are
+write-optimized (HBase, Cassandra, SQLite3/LSM, Cockroach).
+
+![Read vs. Write Optimization Spectrum](/resources/doc/read-vs-write.png?raw=true)
+
 ## Architecture
 
 Cockroach implements a layered architecture, with various
@@ -125,6 +265,42 @@ three ways using raft. The color coding shows associated range
 replicas.
 
 ![Range Architecture Blowup](/resources/doc/architecture-blowup.png?raw=true)
+
+## Client Architecture
+
+Cockroach nodes serve client traffic on two primary HTTP endpoints: a
+RESTful endpoint which treats key/value pairs and sequences of
+key/value pairs as resources; and a fully-featured key/value DB API
+which accepts requests as either application/x-protobuf or
+application/json. Client implementations consist of an HTTP sender
+(transport) and a transactional sender which implements a simple
+exponential backoff / retry protocol, depending on Cockroach error
+codes.
+
+The REST and DB client gateways accept incoming requests and send them
+through a transaction coordinator, which handles transaction
+heartbeats on behalf of clients, provides optimization pathways, and
+resolves write intents on transaction commit or abort. The transaction
+coordinator passes requests onto a distributed sender, which looks up
+index metadata, caches the results, and routes internode RPC traffic
+based on where the index metadata indicates keys are located in the
+distributed cluster.
+
+In addition to the gateways for external REST and DB client traffic,
+each Cockroach node provides the full key/value API (including all
+internal methods) via a Go RPC server endpoint. The RPC server
+endpoint forwards requests to one or more local stores depending
+on the specified key range.
+
+Internally, each Cockroach node uses the Go implementation of the
+Cockroach client in order to transactionally update system key/value
+data; for example during split and merge operations to update index
+metadata records. Unlike an external application, the internal client
+eschews the HTTP sender and instead directly shares the transaction
+coordinator and distributed sender used by the REST and DB client
+gateways.
+
+![Client Architecture](/resources/doc/client-architecture.png?raw=true)
 
 [0]: http://rocksdb.org/
 [1]: https://code.google.com/p/leveldb/

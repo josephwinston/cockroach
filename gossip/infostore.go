@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -22,11 +22,19 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"reflect"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/util"
 )
+
+// callback holds regexp pattern match and GossipCallback method.
+type callback struct {
+	pattern *regexp.Regexp
+	method  Callback
+}
 
 // infoStore objects manage maps of Info and maps of Info Group
 // objects. They maintain a sequence number generator which they use
@@ -39,11 +47,12 @@ import (
 //
 // infoStores are not thread safe.
 type infoStore struct {
-	Infos    infoMap  // Map from key to info
-	Groups   groupMap // Map from key prefix to groups of infos
-	NodeAddr net.Addr // Address of node owning this info store: "host:port"
-	MaxSeq   int64    // Maximum sequence number inserted
-	seqGen   int64    // Sequence generator incremented each time info is added
+	Infos     infoMap  `json:"infos,omitempty"`  // Map from key to info
+	Groups    groupMap `json:"groups,omitempty"` // Map from key prefix to groups of infos
+	NodeAddr  net.Addr `json:"-"`                // Address of node owning this info store: "host:port"
+	MaxSeq    int64    `json:"-"`                // Maximum sequence number inserted
+	seqGen    int64    // Sequence generator incremented each time info is added
+	callbacks []callback
 }
 
 // monotonicUnixNano returns a monotonically increasing value for
@@ -185,27 +194,35 @@ func (is *infoStore) registerGroup(g *group) error {
 func (is *infoStore) addInfo(i *info) error {
 	// If the prefix matches a group, add to group.
 	if group := is.belongsToGroup(i.Key); group != nil {
-		if err := group.addInfo(i); err != nil {
+		contentsChanged, err := group.addInfo(i)
+		if err != nil {
 			return err
 		}
 		if i.seq > is.MaxSeq {
 			is.MaxSeq = i.seq
 		}
+		is.processCallbacks(i.Key, contentsChanged)
 		return nil
 	}
 	// Only replace an existing info if new timestamp is greater, or if
 	// timestamps are equal, but new hops is smaller.
+	var contentsChanged bool
 	if existingInfo, ok := is.Infos[i.Key]; ok {
 		if i.Timestamp < existingInfo.Timestamp ||
 			(i.Timestamp == existingInfo.Timestamp && i.Hops >= existingInfo.Hops) {
-			return util.Errorf("info %+v older than current group info %+v", i, existingInfo)
+			return util.Errorf("info %+v older than current info %+v", i, existingInfo)
 		}
+		contentsChanged = !reflect.DeepEqual(existingInfo.Val, i.Val)
+	} else {
+		// No preexisting info means contentsChanged is true.
+		contentsChanged = true
 	}
 	// Update info map.
 	is.Infos[i.Key] = i
 	if i.seq > is.MaxSeq {
 		is.MaxSeq = i.seq
 	}
+	is.processCallbacks(i.Key, contentsChanged)
 	return nil
 }
 
@@ -234,11 +251,36 @@ func (is *infoStore) maxHops() uint32 {
 	return maxHops
 }
 
+// registerCallback compiles a regexp for pattern and adds it to
+// the callbacks slice.
+func (is *infoStore) registerCallback(pattern string, method Callback) {
+	re := regexp.MustCompile(pattern)
+	is.callbacks = append(is.callbacks, callback{pattern: re, method: method})
+}
+
+// processCallbacks processes callbacks for the specified key by
+// matching callback regular expression against the key and invoking
+// the corresponding callback method on a match.
+func (is *infoStore) processCallbacks(key string, contentsChanged bool) {
+	var matches []callback
+	for _, cb := range is.callbacks {
+		if cb.pattern.MatchString(key) {
+			matches = append(matches, cb)
+		}
+	}
+	// Run callbacks in a goroutine to avoid mutex reentry.
+	go func() {
+		for _, cb := range matches {
+			cb.method(key, contentsChanged)
+		}
+	}()
+}
+
 // visitInfos implements a visitor pattern to run two methods in the
 // course of visiting all groups, all group infos, and all non-group
 // infos. The visitGroup function is run against each group in
 // turn. After each group is visited, the visitInfo function is run
-// against each of its infos.  Finally, after all groups have been
+// against each of its infos. Finally, after all groups have been
 // visitied, the visitInfo function is run against each non-group info
 // in turn. Be sure to skip over any expired infos.
 func (is *infoStore) visitInfos(visitGroup func(*group) error, visitInfo func(*info) error) error {

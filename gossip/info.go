@@ -9,7 +9,7 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
+// implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
 //
@@ -22,21 +22,21 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 // info is the basic unit of information traded over the gossip
 // network.
 type info struct {
 	Key string // Info key
-	// Info value: must be one of {int65, float64, string} or
+	// Info value: must be one of {int64, float64, string} or
 	// implement the util.Ordered interface to be used with groups.
 	// For single infos any type is allowed.
 	Val       interface{}
-	Timestamp int64    // Wall time at origination (Unix-nanos)
-	TTLStamp  int64    // Wall time before info is discarded (Unix-nanos)
-	Hops      uint32   // Number of hops from originator
-	NodeAddr  net.Addr // Originating node in "host:port" format
+	Timestamp int64    `json:"-"` // Wall time at origination (Unix-nanos)
+	TTLStamp  int64    `json:"-"` // Wall time before info is discarded (Unix-nanos)
+	Hops      uint32   `json:"-"` // Number of hops from originator
+	NodeAddr  net.Addr `json:"-"` // Originating node in "host:port" format
 	peerAddr  net.Addr // Proximate peer which passed us the info
 	seq       int64    // Sequence number for incremental updates
 }
@@ -64,7 +64,7 @@ func (i *info) less(b *info) bool {
 		if ord, ok := i.Val.(util.Ordered); ok {
 			return ord.Less(b.Val.(util.Ordered))
 		}
-		glog.Fatalf("unhandled info value type: %s", t)
+		log.Fatalf("unhandled info value type: %s", t)
 	}
 	return false
 }
