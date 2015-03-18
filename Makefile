@@ -29,7 +29,6 @@ STATIC := $(STATIC)
 COCKROACH_IMAGE :=
 
 RUN := run
-export GOPATH := $(CURDIR)/_vendor:$(CURDIR)/../../../..
 
 # TODO(pmattis): Figure out where to clear the CGO_* variables when
 # building "release" binaries.
@@ -47,50 +46,51 @@ ifeq ($(STATIC),1)
 GOFLAGS  += -a -tags netgo -ldflags '-extldflags "-lm -lstdc++ -static"'
 endif
 
+.PHONY: all
 all: build test
 
-# "go build -i" explicitly does not rebuild dependent packages that
-# have a different root directory than the package being built, hence
-# the need for a separate build invocation for etcd/raft.
-build: LDFLAGS += -X github.com/cockroachdb/cockroach/util.buildSHA "$(shell git rev-parse HEAD)"
+.PHONY: build
 build: LDFLAGS += -X github.com/cockroachdb/cockroach/util.buildTag "$(shell git describe --dirty)"
 build: LDFLAGS += -X github.com/cockroachdb/cockroach/util.buildTime "$(shell date -u '+%Y/%m/%d %H:%M:%S')"
-build: LDFLAGS += -X github.com/cockroachdb/cockroach/util.buildDeps "$(shell make depvers | sort)"
+build: LDFLAGS += -X github.com/cockroachdb/cockroach/util.buildDeps "$(shell GOPATH=${GOPATH} build/depvers.sh)"
 build:
-	$(GO) build $(GOFLAGS) -v -i github.com/coreos/etcd/raft
 	$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -v -i -o cockroach
 
+# Similar to "testrace", we want to cache the build before running the
+# tests.
+.PHONY: test
 test:
+	$(GO) test $(GOFLAGS) -i $(PKG)
 	$(GO) test $(GOFLAGS) -run $(TESTS) $(PKG) $(TESTFLAGS)
 
+# "go test -i" builds dependencies and installs them into GOPATH/pkg, but does not run the
+# tests. Run it as a part of "testrace" since race-enabled builds are not covered by
+# "make build", and so they would be built from scratch every time (including the
+# slow-to-compile cgo packages).
+.PHONY: testrace
 testrace:
+	$(GO) test $(GOFLAGS) -race -i $(PKG)
 	$(GO) test $(GOFLAGS) -race -run $(TESTS) $(PKG) $(RACEFLAGS)
 
+.PHONY: bench
 bench:
 	$(GO) test $(GOFLAGS) -run $(TESTS) -bench $(TESTS) $(PKG) $(BENCHFLAGS)
 
 # Build, but do not run the tests. This is used to verify the deployable
 # Docker image which comes without the build environment. See ./build/deploy
 # for details.
-# The test files are moved to the corresponding package. For example,
-# PKG=./storage/engine will generate ./storage/engine/engine.test.
-testbuild: TESTS := $(shell $(GO) list $(PKG))
-testbuild: GOFLAGS += -c
+.PHONY: testbuild
 testbuild:
-	for p in $(TESTS); do \
-	  NAME=$$(basename "$$p"); \
-	  OUT="$$NAME.test"; \
-	  DIR=$$($(GO) list -f {{.Dir}} ./...$$NAME); \
-	  $(GO) test $(GOFLAGS) "$$p" $(TESTFLAGS) || break; \
-	  if [ -f "$$OUT" ]; then \
-		mv "$$OUT" "$$DIR" || break; \
-	  fi \
+	for p in $(shell $(GO) list $(PKG)); do \
+	  $(GO) test $(GOFLAGS) -c -i $$p || exit $?; \
 	done
 
 
+.PHONY: coverage
 coverage: build
 	$(GO) test $(GOFLAGS) -cover -run $(TESTS) $(PKG) $(TESTFLAGS)
 
+.PHONY: acceptance
 acceptance:
 # The first `stop` stops and cleans up any containers from previous runs.
 	(cd $(RUN) && export COCKROACH_IMAGE="$(COCKROACH_IMAGE)" && \
@@ -99,33 +99,35 @@ acceptance:
 	  ./local-cluster.sh start && \
 	  ./local-cluster.sh stop)
 
+.PHONY: errcheck
+errcheck:
+	errcheck -ignore='os:Close,net:Close,code.google.com/p/biogo.store/interval:.*,io:Write,bytes:Write.*' $(PKG)
+
+.PHONY: clean
 clean:
-	$(GO) clean -i github.com/cockroachdb/... github.com/coreos/etcd/...
+	$(GO) clean -i github.com/cockroachdb/...
 	find . -name '*.test' -type f -exec rm -f {} \;
 	rm -rf build/deploy/build
-
-# The gopath target outputs the GOPATH that should be used for building this
-# package. It is used by the emacs go-projectile package for automatic
-# configuration.
-gopath:
-	@echo -n $(GOPATH)
-
 # List all of the dependencies which are not part of the standard
-# library, cockroachdb/cockroach or coreos/etcd.
-godeps:
+# library or cockroachdb/cockroach.
+.PHONY: listdeps
+listdeps:
 	@go list -f '{{range .Deps}}{{printf "%s\n" .}}{{end}}' ./... | \
 	  sort | uniq | egrep '[^/]+\.[^/]+/' | \
-	  egrep -v 'github.com/(cockroachdb/cockroach|coreos/etcd)'
+	  egrep -v 'github.com/cockroachdb/cockroach'
 
-depvers:
-	@SRCDIR=../../..; \
-	  PKGS=$$(go list -f '{{range .Deps}}{{printf "%s\n" .}}{{end}}' ./... | \
-	  sort | uniq | egrep '[^/]+\.[^/]+/' | \
-	  egrep -v 'github.com/(cockroachdb/cockroach|coreos/etcd)' | \
-	  egrep -v 'code.google.com/p/(go-uuid/uuid|snappy-go/snappy)'); \
-	  echo github.com/coreos/etcd:$$(git -C _vendor/src/github.com/coreos/etcd rev-parse HEAD); \
-	  for pkg in $${PKGS}; do \
-	    echo $${pkg}:$$(git -C "$${SRCDIR}/$${pkg}" rev-parse HEAD); \
-	  done
 
-.PHONY: build test testrace bench testbuild coverage acceptance clean gopath godeps depvers
+GITHOOKS := $(subst githooks/,.git/hooks/,$(wildcard githooks/*))
+.git/hooks/%: githooks/%
+	@echo installing $<
+	@rm -f $@
+	@mkdir -p $(dir $@)
+	@ln -s ../../$(basename $<) $(dir $@)
+
+# Update the git hooks and run the bootstrap script whenever either
+# one changes.
+.bootstrap: $(GITHOOKS) build/devbase/godeps.sh
+	@build/devbase/godeps.sh
+	@touch $@
+
+-include .bootstrap

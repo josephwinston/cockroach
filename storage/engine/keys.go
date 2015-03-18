@@ -57,7 +57,7 @@ func MakeRangeIDKey(raftID int64, suffix, detail proto.Key) proto.Key {
 	if len(suffix) != KeyLocalSuffixLength {
 		panic(fmt.Sprintf("suffix len(%q) != %d", suffix, KeyLocalSuffixLength))
 	}
-	return MakeKey(KeyLocalRangeIDPrefix, encoding.EncodeInt(nil, raftID), suffix, detail)
+	return MakeKey(KeyLocalRangeIDPrefix, encoding.EncodeUvarint(nil, uint64(raftID)), suffix, detail)
 }
 
 // RaftLogKey returns a system-local key for a Raft log entry.
@@ -71,9 +71,9 @@ func RaftLogPrefix(raftID int64) proto.Key {
 	return MakeRangeIDKey(raftID, KeyLocalRaftLogSuffix, proto.Key{})
 }
 
-// RaftStateKey returns a system-local key for a Raft HardState.
-func RaftStateKey(raftID int64) proto.Key {
-	return MakeRangeIDKey(raftID, KeyLocalRaftStateSuffix, proto.Key{})
+// RaftHardStateKey returns a system-local key for a Raft HardState.
+func RaftHardStateKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRaftHardStateSuffix, proto.Key{})
 }
 
 // DecodeRaftStateKey extracts the Raft ID from a RaftStateKey.
@@ -83,8 +83,13 @@ func DecodeRaftStateKey(key proto.Key) int64 {
 	}
 	// Cut the prefix and the Raft ID.
 	b := key[len(KeyLocalRangeIDPrefix):]
-	_, raftID := encoding.DecodeInt(b)
-	return raftID
+	_, raftID := encoding.DecodeUvarint(b)
+	return int64(raftID)
+}
+
+// RaftTruncatedStateKey returns a system-local key for a RaftTruncatedState.
+func RaftTruncatedStateKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRaftTruncatedStateSuffix, proto.Key{})
 }
 
 // RangeStatKey returns the key for accessing the named stat
@@ -99,8 +104,8 @@ func RangeStatKey(raftID int64, stat proto.Key) proto.Key {
 func ResponseCacheKey(raftID int64, cmdID *proto.ClientCmdID) proto.Key {
 	detail := proto.Key{}
 	if cmdID != nil {
-		detail = encoding.EncodeInt(nil, cmdID.WallTime)  // wall time helps sort for locality
-		detail = encoding.EncodeInt(detail, cmdID.Random) // TODO(spencer): encode as Fixed64
+		detail = encoding.EncodeUvarint(nil, uint64(cmdID.WallTime)) // wall time helps sort for locality
+		detail = encoding.EncodeUint64(detail, uint64(cmdID.Random))
 	}
 	return MakeRangeIDKey(raftID, KeyLocalResponseCacheSuffix, detail)
 }
@@ -112,7 +117,7 @@ func MakeRangeKey(key, suffix, detail proto.Key) proto.Key {
 	if len(suffix) != KeyLocalSuffixLength {
 		panic(fmt.Sprintf("suffix len(%q) != %d", suffix, KeyLocalSuffixLength))
 	}
-	return MakeKey(KeyLocalRangeKeyPrefix, encoding.EncodeBinary(nil, key), suffix, detail)
+	return MakeKey(KeyLocalRangeKeyPrefix, encoding.EncodeBytes(nil, key), suffix, detail)
 }
 
 // DecodeRangeKey decodes the range key into range start key,
@@ -123,7 +128,7 @@ func DecodeRangeKey(key proto.Key) (startKey, suffix, detail proto.Key) {
 	}
 	// Cut the prefix and the Raft ID.
 	b := key[len(KeyLocalRangeKeyPrefix):]
-	b, startKey = encoding.DecodeBinary(b)
+	b, startKey = encoding.DecodeBytes(b)
 	if len(b) < KeyLocalSuffixLength {
 		panic(fmt.Sprintf("key %q does not have suffix of length %d", key, KeyLocalSuffixLength))
 	}
@@ -133,10 +138,16 @@ func DecodeRangeKey(key proto.Key) (startKey, suffix, detail proto.Key) {
 	return
 }
 
-// RangeScanMetadataKey returns a range-local key for range scan
-// metadata.
-func RangeScanMetadataKey(key proto.Key) proto.Key {
-	return MakeRangeKey(key, KeyLocalRangeScanMetadataSuffix, proto.Key{})
+// RangeGCMetadataKey returns a range-local key for range garbage
+// collection metadata.
+func RangeGCMetadataKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRangeGCMetadataSuffix, proto.Key{})
+}
+
+// RangeLastVerificationTimestampKey returns a range-local key for
+// the range's last verification timestamp.
+func RangeLastVerificationTimestampKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRangeLastVerificationTimestampSuffix, proto.Key{})
 }
 
 // RangeDescriptorKey returns a range-local key for the descriptor
@@ -172,7 +183,7 @@ func KeyAddress(k proto.Key) proto.Key {
 	}
 	if bytes.HasPrefix(k, KeyLocalRangeKeyPrefix) {
 		k = k[len(KeyLocalRangeKeyPrefix):]
-		_, k = encoding.DecodeBinary(k)
+		_, k = encoding.DecodeBytes(k)
 		return k
 	}
 	log.Fatalf("local key %q malformed; should contain prefix %q", k, KeyLocalRangeKeyPrefix)
@@ -290,6 +301,10 @@ var (
 	// KeyMax is a maximum key value which sorts after all other keys.
 	KeyMax = proto.KeyMax
 
+	// MVCCKeyMax is a maximum mvcc-encoded key value which sorts after
+	// all other keys.
+	MVCCKeyMax = MVCCEncodeKey(KeyMax)
+
 	// KeyLocalPrefix is the prefix for keys which hold data local to a
 	// RocksDB instance, such as store and range-specific metadata which
 	// must not pollute the user key space, but must be collocate with
@@ -330,15 +345,25 @@ var (
 
 	// KeyLocalRangeIDPrefix is the prefix identifying per-range data
 	// indexed by Raft ID. The Raft ID is appended to this prefix,
-	// encoded using EncodeInt. The specific sort of per-range metadata
-	// is identified by one of the suffixes listed below, along with
-	// potentially additional encoded key info, such as a command ID in
-	// the case of response cache entry.
+	// encoded using EncodeUvarint. The specific sort of per-range
+	// metadata is identified by one of the suffixes listed below, along
+	// with potentially additional encoded key info, such as a command
+	// ID in the case of response cache entry.
+	//
+	// NOTE: KeyLocalRangeIDPrefix must be kept in sync with the value
+	// in storage/engine/db.cc.
 	KeyLocalRangeIDPrefix = MakeKey(KeyLocalPrefix, proto.Key("i"))
 	// KeyLocalRaftLogSuffix is the suffix for the raft log.
 	KeyLocalRaftLogSuffix = proto.Key("rftl")
-	// KeyLocalRaftStateSuffix is the Suffix for the raft HardState.
-	KeyLocalRaftStateSuffix = proto.Key("rfts")
+	// KeyLocalRaftHardStateSuffix is the Suffix for the raft HardState.
+	KeyLocalRaftHardStateSuffix = proto.Key("rfth")
+	// KeyLocalRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
+	KeyLocalRaftTruncatedStateSuffix = proto.Key("rftt")
+	// KeyLocalRangeGCMetadataSuffix is the suffix for a range's GC metadata.
+	KeyLocalRangeGCMetadataSuffix = proto.Key("rgcm")
+	// KeyLocalRangeLastVerificationTimestampSuffix is the suffix for a range's
+	// last verification timestamp (for checking integrity of on-disk data).
+	KeyLocalRangeLastVerificationTimestampSuffix = proto.Key("rlvt")
 	// KeyLocalRangeStatSuffix is the suffix for range statistics.
 	KeyLocalRangeStatSuffix = proto.Key("rst-")
 	// KeyLocalResponseCacheSuffix is the suffix for keys storing
@@ -351,16 +376,17 @@ var (
 	// KeyLocalRangeKeyPrefix is the prefix identifying per-range data
 	// indexed by range key (either start key, or some key in the
 	// range). The key is appended to this prefix, encoded using
-	// EncodeBinary. The specific sort of per-range metadata is
+	// EncodeBytes. The specific sort of per-range metadata is
 	// identified by one of the suffixes listed below, along with
 	// potentially additional encoded key info, such as the txn UUID in
 	// the case of a transaction record.
+	//
+	// NOTE: KeyLocalRangeKeyPrefix must be kept in sync with the value
+	// in storage/engine/db.cc.
 	KeyLocalRangeKeyPrefix = MakeKey(KeyLocalPrefix, proto.Key("k"))
 	// KeyLocalRangeDescriptorSuffix is the suffix for keys storing
 	// range descriptors. The value is a struct of type RangeDescriptor.
 	KeyLocalRangeDescriptorSuffix = proto.Key("rdsc")
-	// KeyLocalRangeScanMetadataSuffix is the suffix for a range's scan metadata.
-	KeyLocalRangeScanMetadataSuffix = proto.Key("rscm")
 	// KeyLocalTransactionSuffix specifies the key suffix for
 	// transaction records. The additional detail is the transaction id.
 	// NOTE: if this value changes, it must be updated in C++

@@ -14,62 +14,82 @@
 // for names of contributors.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
+// Author: Peter Mattis (petermattis@gmail.com)
 
 #include "rocksdb/slice.h"
 
 namespace {
 
-const unsigned char kOrderedEncodingBinary     = 0x25;
-const unsigned char kOrderedEncodingTerminator = 0x00;
+const uint8_t kEscape1     = 0x00;
+const uint8_t kEscape2     = 0xff;
+const uint8_t kEscapedTerm = 0x01;
+const uint8_t kEscapedNul  = 0xff;
+const uint8_t kEscapedFF   = 0x00;
 
+template <typename T>
+bool DecodeUvarint(rocksdb::Slice* buf, T* value) {
+  if (buf->empty()) {
+    return false;
+  }
+  int len = (*buf)[0] - 8;
+  if (len < 0) {
+    return false;
+  }
+  if ((len + 1) > buf->size()) {
+    return false;
+  }
+  if (len > sizeof(T)) {
+    // Decoded value will overflow.
+    return false;
+  }
+
+  *value = 0;
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buf->data()) + len;
+  for (int i = 0; i < len; ++i) {
+    *value |= static_cast<T>(*ptr--) << (i * 8);
+  }
+  buf->remove_prefix(len + 1);
+
+  return true;
 }
 
-bool DecodeBinary(const rocksdb::Slice& buf, std::string* decoded, std::string* remainder) {
-  if (buf[0] != kOrderedEncodingBinary) {
-    fprintf(stderr, "%s doesn't begin with binary encoding byte\n", buf.ToString().c_str());
-    return false;
-  }
-  decoded->clear();
-  int s = 6;
-  int i = 1;
-  if (buf[i] == kOrderedEncodingTerminator) {
-    if (remainder != NULL) {
-      rocksdb::Slice remSlice(buf);
-      remSlice.remove_prefix(2);
-      *remainder = remSlice.ToString();
+}  // namespace
+
+// TODO(pmattis): These functions are not tested. Doing so is made
+// difficult by "go test" because _test.go files cannot 'import "C"'.
+bool DecodeBytes(rocksdb::Slice* buf, std::string* decoded) {
+  const uint8_t *data = reinterpret_cast<const uint8_t*>(buf->data());
+  if (buf->size() > 0 && data[0] == kEscape2) {
+    if (buf->size() == 1) {
+      return false;
     }
-    return true;
+    if (data[1] != kEscapedFF) {
+      return false;
+    }
+    decoded->append("\xff", 1);
+    buf->remove_prefix(2);
   }
 
-  int t = (buf[i] << 1) & 0xff;
-  for (i = 2; buf[i] != kOrderedEncodingTerminator; i++) {
-    if (s == 7) {
-      decoded->push_back(t | (buf[i] & 0x7f));
-      i++;
-    } else {
-      decoded->push_back(t | ((buf[i] & 0x7f) >> s));
-    }
-
-    t = (buf[i] << (8 - s)) & 0xff;
-
-    if (buf[i] == kOrderedEncodingTerminator) {
-      break;
-    }
-
-    if (s == 1) {
-      s = 7;
-    } else {
-      s--;
+  int copyStart = 0;
+  for (int i = 0, n = int(buf->size()) - 1; i < n; ++i) {
+    uint8_t v = data[i];
+    if (v == kEscape1) {
+      decoded->append(buf->data() + copyStart, i-copyStart);
+      v = data[++i];
+      if (v == kEscapedTerm) {
+        buf->remove_prefix(i + 1);
+        return true;
+      }
+      if (v != kEscapedNul) {
+        return false;
+      }
+      decoded->append("\0", 1);
+      copyStart = i + 1;
     }
   }
-  if (t != 0) {
-    fprintf(stderr, "%s doesn't begin with binary encoding byte\n", buf.ToString().c_str());
-    return false;
-  }
-  if (remainder != NULL) {
-    rocksdb::Slice remSlice(buf);
-    remSlice.remove_prefix(i+1);
-    *remainder = remSlice.ToString();
-  }
-  return true;
+  return false;
+}
+
+bool DecodeUvarint64(rocksdb::Slice* buf, uint64_t* value) {
+  return DecodeUvarint(buf, value);
 }

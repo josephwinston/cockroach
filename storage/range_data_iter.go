@@ -43,21 +43,21 @@ type rangeDataIterator struct {
 
 func newRangeDataIterator(r *Range, e engine.Engine) *rangeDataIterator {
 	r.RLock()
-	startKey := r.Desc.StartKey
+	startKey := r.Desc().StartKey
 	if startKey.Equal(engine.KeyMin) {
 		startKey = engine.KeyLocalMax
 	}
-	endKey := r.Desc.EndKey
+	endKey := r.Desc().EndKey
 	r.RUnlock()
 	ri := &rangeDataIterator{
 		ranges: []keyRange{
 			{
-				start: engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeIDPrefix, encoding.EncodeInt(nil, r.Desc.RaftID))),
-				end:   engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeIDPrefix, encoding.EncodeInt(nil, r.Desc.RaftID+1))),
+				start: engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeIDPrefix, encoding.EncodeUvarint(nil, uint64(r.Desc().RaftID)))),
+				end:   engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeIDPrefix, encoding.EncodeUvarint(nil, uint64(r.Desc().RaftID+1)))),
 			},
 			{
-				start: engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeKeyPrefix, encoding.EncodeBinary(nil, startKey))),
-				end:   engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeKeyPrefix, encoding.EncodeBinary(nil, endKey))),
+				start: engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeKeyPrefix, encoding.EncodeBytes(nil, startKey))),
+				end:   engine.MVCCEncodeKey(engine.MakeKey(engine.KeyLocalRangeKeyPrefix, encoding.EncodeBytes(nil, endKey))),
 			},
 			{
 				start: engine.MVCCEncodeKey(startKey),
@@ -116,7 +116,7 @@ func (ri *rangeDataIterator) advance() {
 			ri.iter.Seek(ri.ranges[ri.curIndex].start)
 		} else {
 			// Otherwise, seek to end to make iterator invalid.
-			ri.iter.Seek(engine.MVCCEncodeKey(engine.KeyMax))
+			ri.iter.Seek(engine.MVCCKeyMax)
 			return
 		}
 	}

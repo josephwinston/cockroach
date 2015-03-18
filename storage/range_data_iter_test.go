@@ -18,11 +18,35 @@
 package storage
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
 )
+
+func prevKey(k proto.Key) proto.Key {
+	length := len(k)
+
+	// When the byte array is empty.
+	if length == 0 {
+		panic(fmt.Sprint("cannot get the prev key of an empty key"))
+	}
+
+	// If the last byte is a 0, then drop it.
+	if k[length-1] == 0 {
+		return k[0 : length-1]
+	}
+
+	// If the last byte isn't 0, subtract one from it and append "\xff"s
+	// until the end of the key space.
+	return bytes.Join([][]byte{
+		k[0 : length-1],
+		[]byte{k[length-1] - 1},
+		bytes.Repeat([]byte{0xff}, engine.KeyMaxLength-length),
+	}, nil)
+}
 
 // createRangeData creates sample range data in all possible areas of
 // the key space. Returns a slice of the encoded keys of all created
@@ -34,20 +58,21 @@ func createRangeData(r *Range, t *testing.T) []proto.EncodedKey {
 		key proto.Key
 		ts  proto.Timestamp
 	}{
-		{engine.ResponseCacheKey(r.Desc.RaftID, &proto.ClientCmdID{WallTime: 1, Random: 1}), ts0},
-		{engine.ResponseCacheKey(r.Desc.RaftID, &proto.ClientCmdID{WallTime: 2, Random: 2}), ts0},
-		{engine.RaftLogKey(r.Desc.RaftID, 2), ts0},
-		{engine.RaftLogKey(r.Desc.RaftID, 1), ts0},
-		{engine.RaftStateKey(r.Desc.RaftID), ts0},
-		{engine.RangeStatKey(r.Desc.RaftID, engine.StatKeyBytes), ts0},
-		{engine.RangeStatKey(r.Desc.RaftID, engine.StatKeyCount), ts0},
-		{engine.RangeDescriptorKey(r.Desc.StartKey), ts},
-		{engine.RangeScanMetadataKey(r.Desc.StartKey), ts0},
-		{engine.TransactionKey(r.Desc.StartKey, []byte("1234")), ts0},
-		{engine.TransactionKey(r.Desc.StartKey.Next(), []byte("5678")), ts0},
-		{engine.TransactionKey(r.Desc.EndKey.Prev(), []byte("2468")), ts0},
-		{r.Desc.StartKey.Next(), ts},
-		{r.Desc.EndKey.Prev(), ts},
+		{engine.ResponseCacheKey(r.Desc().RaftID, &proto.ClientCmdID{WallTime: 1, Random: 1}), ts0},
+		{engine.ResponseCacheKey(r.Desc().RaftID, &proto.ClientCmdID{WallTime: 2, Random: 2}), ts0},
+		{engine.RaftHardStateKey(r.Desc().RaftID), ts0},
+		{engine.RaftLogKey(r.Desc().RaftID, 2), ts0},
+		{engine.RaftLogKey(r.Desc().RaftID, 1), ts0},
+		{engine.RangeGCMetadataKey(r.Desc().RaftID), ts0},
+		{engine.RangeLastVerificationTimestampKey(r.Desc().RaftID), ts0},
+		{engine.RangeStatKey(r.Desc().RaftID, engine.StatKeyBytes), ts0},
+		{engine.RangeStatKey(r.Desc().RaftID, engine.StatKeyCount), ts0},
+		{engine.RangeDescriptorKey(r.Desc().StartKey), ts},
+		{engine.TransactionKey(r.Desc().StartKey, []byte("1234")), ts0},
+		{engine.TransactionKey(r.Desc().StartKey.Next(), []byte("5678")), ts0},
+		{engine.TransactionKey(prevKey(r.Desc().EndKey), []byte("2468")), ts0},
+		{r.Desc().StartKey.Next(), ts},
+		{prevKey(r.Desc().EndKey), ts},
 	}
 
 	keys := []proto.EncodedKey{}
@@ -75,13 +100,9 @@ func TestRangeDataIteratorEmptyRange(t *testing.T) {
 	// Adjust the range descriptor to avoid existing data such as meta
 	// records and config entries during the iteration. This is a rather
 	// nasty little hack, but since it's test code, meh.
-	tc.rng.Lock()
-	tc.store.mu.Lock()
-	newDesc := *tc.rng.Desc
+	newDesc := *tc.rng.Desc()
 	newDesc.StartKey = proto.Key("a")
-	tc.rng.Desc = &newDesc
-	tc.store.mu.Unlock()
-	tc.rng.Unlock()
+	tc.rng.SetDesc(&newDesc)
 
 	iter := newRangeDataIterator(tc.rng, tc.rng.rm.Engine())
 	defer iter.Close()
@@ -103,14 +124,10 @@ func TestRangeDataIterator(t *testing.T) {
 	defer tc.Stop()
 
 	// See notes in EmptyRange test method for adjustment to descriptor.
-	tc.rng.Lock()
-	tc.store.mu.Lock()
-	newDesc := *tc.rng.Desc
+	newDesc := *tc.rng.Desc()
 	newDesc.StartKey = proto.Key("b")
 	newDesc.EndKey = proto.Key("c")
-	tc.rng.Desc = &newDesc
-	tc.store.mu.Unlock()
-	tc.rng.Unlock()
+	tc.rng.SetDesc(&newDesc)
 
 	// Create two more ranges, one before the test range and one after.
 	preRng := createRange(tc.store, 2, proto.Key("a"), proto.Key("b"))
@@ -139,7 +156,7 @@ func TestRangeDataIterator(t *testing.T) {
 		if key := iter.Key(); !key.Equal(keys[i]) {
 			k1, ts1, _ := engine.MVCCDecodeKey(key)
 			k2, ts2, _ := engine.MVCCDecodeKey(keys[i])
-			t.Errorf("%d: key mismatch %q(%d) != %q(%d)", i, k1, ts1, k2, ts2)
+			t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
 		}
 		i++
 	}

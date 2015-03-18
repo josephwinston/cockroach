@@ -15,11 +15,13 @@
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-package proto;
+syntax = "proto2";
+package cockroach.proto;
+option go_package = "proto";
 
-import "config.proto";
-import "data.proto";
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "cockroach/proto/config.proto";
+import "cockroach/proto/data.proto";
+import "gogoproto/gogo.proto";
 
 // A GenericError is a generic representation of a go error including
 // the string message and whether or not the error is retryable.
@@ -64,7 +66,7 @@ message TransactionAbortedError {
 }
 
 // A TransactionPushError indicates that the transaction could not
-// continu because it encountered a write intent from another
+// continue because it encountered a write intent from another
 // transaction which it was unable to push.
 message TransactionPushError {
   // txn can be null in the event the push error happened to a
@@ -144,4 +146,3 @@ message Error {
   optional OpRequiresTxnError op_requires_txn = 12;
   optional ConditionFailedError condition_failed = 13;
 }
-

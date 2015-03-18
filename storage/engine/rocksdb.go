@@ -45,9 +45,20 @@ type RocksDB struct {
 
 // NewRocksDB allocates and returns a new RocksDB object.
 func NewRocksDB(attrs proto.Attributes, dir string, cacheSize int64) *RocksDB {
+	if dir == "" {
+		panic(util.Errorf("dir must be non-empty"))
+	}
 	return &RocksDB{
 		attrs:     attrs,
 		dir:       dir,
+		cacheSize: cacheSize,
+	}
+}
+
+func newMemRocksDB(attrs proto.Attributes, cacheSize int64) *RocksDB {
+	return &RocksDB{
+		attrs: attrs,
+		// dir: empty dir == "mem" RocksDB instance.
 		cacheSize: cacheSize,
 	}
 }
@@ -68,8 +79,8 @@ func (r *RocksDB) Start() error {
 	status := C.DBOpen(&r.rdb, goToCSlice([]byte(r.dir)),
 		C.DBOptions{
 			cache_size:      C.int64_t(r.cacheSize),
-			allow_os_buffer: C.int(1),
-			logger:          C.DBLoggerFunc(nil),
+			allow_os_buffer: C.bool(true),
+			logging_enabled: C.bool(log.V(1)),
 		})
 	err := statusToError(status)
 	if err != nil {
@@ -227,7 +238,11 @@ func (r *RocksDB) WriteBatch(cmds []interface{}) error {
 func (r *RocksDB) Capacity() (StoreCapacity, error) {
 	var fs syscall.Statfs_t
 	var capacity StoreCapacity
-	if err := syscall.Statfs(r.dir, &fs); err != nil {
+	dir := r.dir
+	if dir == "" {
+		dir = "/tmp"
+	}
+	if err := syscall.Statfs(dir, &fs); err != nil {
 		return capacity, err
 	}
 	capacity.Capacity = int64(fs.Bsize) * int64(fs.Blocks)
@@ -436,6 +451,11 @@ func (r *rocksDBSnapshot) ApproximateSize(start, end proto.EncodedKey) (uint64, 
 	return r.parent.ApproximateSize(start, end)
 }
 
+// Flush is a no-op for snapshots.
+func (r *rocksDBSnapshot) Flush() error {
+	return nil
+}
+
 // NewIterator returns a new instance of an Iterator over the
 // engine using the snapshot handle.
 func (r *rocksDBSnapshot) NewIterator() Iterator {
@@ -513,4 +533,11 @@ func (r *rocksDBIterator) Value() []byte {
 
 func (r *rocksDBIterator) Error() error {
 	return statusToError(C.DBIterError(r.iter))
+}
+
+//export rocksDBLog
+func rocksDBLog(s *C.char, n C.int) {
+	// Note that rocksdb logging is only enabled if log.V(1) is true
+	// when RocksDB.Start() is called.
+	log.Infof("%s", C.GoStringN(s, n))
 }

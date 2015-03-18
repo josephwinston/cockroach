@@ -86,7 +86,9 @@ type MultiRaft struct {
 	createGroupChan chan *createGroupOp
 	removeGroupChan chan *removeGroupOp
 	proposalChan    chan *proposal
-	stopper         *util.Stopper
+	// callbackChan is a generic hook to run a callback in the raft thread.
+	callbackChan chan func()
+	stopper      *util.Stopper
 }
 
 // multiraftServer is a type alias to separate RPC methods
@@ -130,6 +132,7 @@ func NewMultiRaft(nodeID NodeID, config *Config) (*MultiRaft, error) {
 		createGroupChan: make(chan *createGroupOp, 100),
 		removeGroupChan: make(chan *removeGroupOp, 100),
 		proposalChan:    make(chan *proposal, 100),
+		callbackChan:    make(chan func(), 100),
 		stopper:         util.NewStopper(1),
 	}
 
@@ -199,13 +202,16 @@ func (s *state) fanoutHeartbeat(req *RaftMessageRequest) {
 		// some group, so we need to respond so it can activate the recovery process.
 		log.Warningf("node %v: not fanning out heartbeat from unknown node %v (but responding anyway)",
 			s.nodeID, fromID)
-		s.Transport.Send(fromID, &RaftMessageRequest{
+		err := s.Transport.Send(fromID, &RaftMessageRequest{
 			GroupID: math.MaxUint64,
 			Message: raftpb.Message{
 				From: uint64(s.nodeID),
 				Type: raftpb.MsgHeartbeatResp,
 			},
 		})
+		if err != nil {
+			log.Errorf("node %v: error sending heartbeat response to %v", s.nodeID, fromID)
+		}
 		return
 	}
 	cnt := 0
@@ -293,7 +299,11 @@ func (m *MultiRaft) SubmitCommand(groupID uint64, commandID string, command []by
 		groupID:   groupID,
 		commandID: commandID,
 		fn: func() {
-			m.multiNode.Propose(context.Background(), uint64(groupID), encodeCommand(commandID, command))
+			err := m.multiNode.Propose(context.Background(), uint64(groupID),
+				encodeCommand(commandID, command))
+			if err != nil {
+				log.Errorf("node %v: error proposing command to group %v: %s", m.nodeID, groupID, err)
+			}
 		},
 		ch: ch,
 	}
@@ -301,20 +311,26 @@ func (m *MultiRaft) SubmitCommand(groupID uint64, commandID string, command []by
 }
 
 // ChangeGroupMembership submits a proposed membership change to the cluster.
+// Payload is an opaque blob that will be returned in EventMembershipChangeCommitted.
 func (m *MultiRaft) ChangeGroupMembership(groupID uint64, commandID string,
-	changeType raftpb.ConfChangeType, nodeID NodeID) chan struct{} {
+	changeType raftpb.ConfChangeType, nodeID NodeID, payload []byte) chan struct{} {
 	log.V(6).Infof("node %v proposing membership change to group %v", m.nodeID, groupID)
 	ch := make(chan struct{})
 	m.proposalChan <- &proposal{
 		groupID:   groupID,
 		commandID: commandID,
 		fn: func() {
-			m.multiNode.ProposeConfChange(context.Background(), uint64(groupID),
+			err := m.multiNode.ProposeConfChange(context.Background(), uint64(groupID),
 				raftpb.ConfChange{
 					Type:    changeType,
 					NodeID:  uint64(nodeID),
-					Context: encodeCommand(commandID, nil),
+					Context: encodeCommand(commandID, payload),
 				})
+			if err != nil {
+				log.Errorf("node %v: error proposing membership change to node %v: %s", m.nodeID,
+					groupID, err)
+			}
+
 		},
 		ch: ch,
 	}
@@ -482,6 +498,9 @@ func (s *state) start() {
 				ticks = 0
 				s.coalescedHeartbeat()
 			}
+
+		case cb := <-s.callbackChan:
+			cb()
 		}
 	}
 }
@@ -503,11 +522,14 @@ func (s *state) coalescedHeartbeat() {
 			To:   uint64(nodeID),
 			Type: raftpb.MsgHeartbeat,
 		}
-		s.Transport.Send(nodeID,
+		err := s.Transport.Send(nodeID,
 			&RaftMessageRequest{
 				GroupID: math.MaxUint64, // irrelevant
 				Message: msg,
 			})
+		if err != nil {
+			log.Errorf("node %v: error sending coalesced heartbeat to %v: %s", s.nodeID, nodeID, err)
+		}
 	}
 }
 
@@ -553,24 +575,32 @@ func (s *state) createGroup(groupID uint64) error {
 	if err != nil {
 		return err
 	}
-	for _, nodeID := range cs.Nodes {
-		s.addNode(NodeID(nodeID), groupID)
+	if err := s.multiNode.CreateGroup(groupID, nil, gs); err != nil {
+		return err
 	}
-
-	s.multiNode.CreateGroup(groupID, nil, gs)
 	s.groups[groupID] = &group{
 		pending: map[string]*proposal{},
 	}
 
 	for _, nodeID := range cs.Nodes {
-		s.addNode(NodeID(nodeID), groupID)
+		if err := s.addNode(NodeID(nodeID), groupID); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (s *state) removeGroup(op *removeGroupOp) {
-	s.multiNode.RemoveGroup(op.groupID)
+	// Group creation is lazy and idempotent; so is removal.
+	if _, ok := s.groups[op.groupID]; !ok {
+		op.ch <- nil
+		return
+	}
+	if err := s.multiNode.RemoveGroup(op.groupID); err != nil {
+		op.ch <- err
+		return
+	}
 	gs := s.Storage.GroupStorage(op.groupID)
 	_, cs, err := gs.InitialState()
 	if err != nil {
@@ -696,30 +726,49 @@ func (s *state) handleWriteResponse(response *writeResponse, readyGroups map[uin
 				if err != nil {
 					log.Fatalf("invalid ConfChange data: %s", err)
 				}
+				var payload []byte
 				if len(cc.Context) > 0 {
-					commandID, _ = decodeCommand(cc.Context)
+					commandID, payload = decodeCommand(cc.Context)
 				}
-				log.V(3).Infof("node %v applying configuration change %v", s.nodeID, cc)
-				// TODO(bdarnell): dedupe by keeping a record of recently-applied commandIDs
-				switch cc.Type {
-				case raftpb.ConfChangeAddNode:
-					err = s.addNode(NodeID(cc.NodeID), groupID)
-				case raftpb.ConfChangeRemoveNode:
-					// TODO(bdarnell): support removing nodes; fix double-application of initial entries
-					continue
-				case raftpb.ConfChangeUpdateNode:
-					// Updates don't concern multiraft, they are simply passed through.
-				}
-				if err != nil {
-					log.Errorf("error applying configuration change %v: %s", cc, err)
-				}
-				cs := s.multiNode.ApplyConfChange(groupID, cc)
 				s.sendEvent(&EventMembershipChangeCommitted{
 					GroupID:    groupID,
 					CommandID:  commandID,
 					NodeID:     NodeID(cc.NodeID),
 					ChangeType: cc.Type,
-					ConfState:  *cs,
+					Payload:    payload,
+					Callback: func(err error) {
+						s.callbackChan <- func() {
+							if err == nil {
+								log.V(3).Infof("node %v applying configuration change %v", s.nodeID, cc)
+								// TODO(bdarnell): dedupe by keeping a record of recently-applied commandIDs
+								switch cc.Type {
+								case raftpb.ConfChangeAddNode:
+									err = s.addNode(NodeID(cc.NodeID), groupID)
+								case raftpb.ConfChangeRemoveNode:
+									// TODO(bdarnell): support removing nodes; fix double-application of initial entries
+								case raftpb.ConfChangeUpdateNode:
+									// Updates don't concern multiraft, they are simply passed through.
+								}
+								if err != nil {
+									log.Errorf("error applying configuration change %v: %s", cc, err)
+								}
+								s.multiNode.ApplyConfChange(groupID, cc)
+							} else {
+								log.Warningf("aborting configuration change: %s", err)
+								s.multiNode.ApplyConfChange(groupID,
+									raftpb.ConfChange{})
+							}
+
+							// Re-submit all pending proposals, in case any of them were config changes
+							// that were dropped due to the one-at-a-time rule. This is a little
+							// redundant since most pending proposals won't benefit from this but
+							// config changes should be rare enough (and the size of the pending queue
+							// small enough) that it doesn't really matter.
+							for _, prop := range g.pending {
+								s.proposalChan <- prop
+							}
+						}
+					},
 				})
 			}
 			if p, ok := g.pending[commandID]; ok {
@@ -727,6 +776,8 @@ func (s *state) handleWriteResponse(response *writeResponse, readyGroups map[uin
 				// application consumes EventCommandCommitted. Is closing the channel
 				// at this point useful or do we need to wait for the command to be
 				// applied too?
+				// This could be done with a Callback as in EventMembershipChangeCommitted
+				// or perhaps we should move away from a channel to a callback-based system.
 				if p.ch != nil {
 					// Because of the way we re-queue proposals during leadership
 					// changes, we may close the same proposal object twice.
@@ -758,9 +809,22 @@ func (s *state) handleWriteResponse(response *writeResponse, readyGroups map[uin
 			nodeID := NodeID(msg.To)
 			if _, ok := s.nodes[nodeID]; !ok {
 				log.V(4).Infof("node %v: connecting to new node %v", s.nodeID, nodeID)
-				s.addNode(nodeID, groupID)
+				if err := s.addNode(nodeID, groupID); err != nil {
+					log.Errorf("node %v: error adding node %v", s.nodeID, nodeID)
+				}
 			}
-			s.Transport.Send(NodeID(msg.To), &RaftMessageRequest{groupID, msg})
+			err := s.Transport.Send(NodeID(msg.To), &RaftMessageRequest{groupID, msg})
+			snapStatus := raft.SnapshotFinish
+			if err != nil {
+				log.Warningf("node %v failed to send message to %v", s.nodeID, nodeID)
+				s.multiNode.ReportUnreachable(msg.To, groupID)
+				snapStatus = raft.SnapshotFailure
+			}
+			if msg.Type == raftpb.MsgSnap {
+				// TODO(bdarnell): add an ack for snapshots and don't report status until
+				// ack, error, or timeout.
+				s.multiNode.ReportSnapshot(msg.To, groupID, snapStatus)
+			}
 		}
 	}
 }

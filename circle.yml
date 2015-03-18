@@ -30,6 +30,9 @@ dependencies:
 
 test:
   override:
+    # Check whether the committer forgot to run `go generate`.
+    # Either `go generate` does not change any files or it does, in which case we print the diff and fail.
+    - docker run cockroachdb/cockroach-dev shell "(go generate ./... && git ls-files --modified --deleted --others --exclude-standard | diff /dev/null -) || (git add -A && git diff -u HEAD && false)" | tee "${CIRCLE_ARTIFACTS}/generate.log"; test ${PIPESTATUS[0]} -eq 0
     - docker run "cockroachdb/cockroach-dev" test TESTFLAGS='-logtostderr -timeout 30s -vmodule=multiraft=5' | tee "${CIRCLE_ARTIFACTS}/test.log"; test ${PIPESTATUS[0]} -eq 0
     - docker run "cockroachdb/cockroach-dev" testrace RACEFLAGS='-logtostderr -timeout 5m -vmodule=multiraft=5' | tee "${CIRCLE_ARTIFACTS}/testrace.log"; test ${PIPESTATUS[0]} -eq 0
       # Kill off the previous images since we don't care for them any more,
@@ -45,7 +48,7 @@ deployment:
   docker:
     branch: master
     commands:
-      - sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < "resources/deploy_templates/.dockercfg.template" > ~/.dockercfg
+      - sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < "resource/deploy_templates/.dockercfg.template" > ~/.dockercfg
       - |
           VERSION=$(git describe 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
           echo "Deploying ${VERSION}..."

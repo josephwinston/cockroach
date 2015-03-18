@@ -22,6 +22,8 @@ import (
 	"math"
 	"reflect"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/util"
 )
 
 func TestEncoding(t *testing.T) {
@@ -122,12 +124,12 @@ func testBasicEncodeDecode32(enc func([]byte, uint32) []byte,
 		if i > 0 {
 			if (decreasing && bytes.Compare(enc, lastEnc) >= 0) ||
 				(!decreasing && bytes.Compare(enc, lastEnc) < 0) {
-				t.Errorf("ordered constraint violated for %d: %s vs. %s", v, enc, lastEnc)
+				t.Errorf("ordered constraint violated for %d: [% x] vs. [% x]", v, enc, lastEnc)
 			}
 		}
 		b, decode := dec(enc)
 		if len(b) != 0 {
-			t.Errorf("leftover bytes: %s", b)
+			t.Errorf("leftover bytes: [% x]", b)
 		}
 		if decode != v {
 			t.Errorf("decode yielded different value than input: %d vs. %d", decode, v)
@@ -136,43 +138,44 @@ func testBasicEncodeDecode32(enc func([]byte, uint32) []byte,
 	}
 }
 
-type testCase32 struct {
+type testCaseUint32 struct {
 	value  uint32
 	expEnc []byte
 }
 
-func testCustomEncode32(testCases []testCase32, enc func([]byte, uint32) []byte, t *testing.T) {
+func testCustomEncodeUint32(testCases []testCaseUint32,
+	enc func([]byte, uint32) []byte, t *testing.T) {
 	for _, test := range testCases {
 		enc := enc(nil, test.value)
 		if bytes.Compare(enc, test.expEnc) != 0 {
-			t.Errorf("expected %s; got %s", test.expEnc, enc)
+			t.Errorf("expected [% x]; got [% x]", test.expEnc, enc)
 		}
 	}
 }
 
 func TestEncodeDecodeUint32(t *testing.T) {
 	testBasicEncodeDecode32(EncodeUint32, DecodeUint32, false, t)
-	testCases := []testCase32{
+	testCases := []testCaseUint32{
 		{0, []byte{0x00, 0x00, 0x00, 0x00}},
 		{1, []byte{0x00, 0x00, 0x00, 0x01}},
 		{1 << 8, []byte{0x00, 0x00, 0x01, 0x00}},
 		{math.MaxUint32, []byte{0xff, 0xff, 0xff, 0xff}},
 	}
-	testCustomEncode32(testCases, EncodeUint32, t)
+	testCustomEncodeUint32(testCases, EncodeUint32, t)
 }
 
 func TestEncodeDecodeUint32Decreasing(t *testing.T) {
 	testBasicEncodeDecode32(EncodeUint32Decreasing, DecodeUint32Decreasing, true, t)
-	testCases := []testCase32{
+	testCases := []testCaseUint32{
 		{0, []byte{0xff, 0xff, 0xff, 0xff}},
 		{1, []byte{0xff, 0xff, 0xff, 0xfe}},
 		{1 << 8, []byte{0xff, 0xff, 0xfe, 0xff}},
 		{math.MaxUint32, []byte{0x00, 0x00, 0x00, 0x00}},
 	}
-	testCustomEncode32(testCases, EncodeUint32Decreasing, t)
+	testCustomEncodeUint32(testCases, EncodeUint32Decreasing, t)
 }
 
-func testBasicEncodeDecode64(enc func([]byte, uint64) []byte,
+func testBasicEncodeDecodeUint64(enc func([]byte, uint64) []byte,
 	dec func([]byte) ([]byte, uint64), decreasing bool, t *testing.T) {
 	testCases := []uint64{
 		0, 1,
@@ -192,12 +195,12 @@ func testBasicEncodeDecode64(enc func([]byte, uint64) []byte,
 		if i > 0 {
 			if (decreasing && bytes.Compare(enc, lastEnc) >= 0) ||
 				(!decreasing && bytes.Compare(enc, lastEnc) < 0) {
-				t.Errorf("ordered constraint violated for %d: %s vs. %s", v, enc, lastEnc)
+				t.Errorf("ordered constraint violated for %d: [% x] vs. [% x]", v, enc, lastEnc)
 			}
 		}
 		b, decode := dec(enc)
 		if len(b) != 0 {
-			t.Errorf("leftover bytes: %s", b)
+			t.Errorf("leftover bytes: [% x]", b)
 		}
 		if decode != v {
 			t.Errorf("decode yielded different value than input: %d vs. %d", decode, v)
@@ -206,61 +209,367 @@ func testBasicEncodeDecode64(enc func([]byte, uint64) []byte,
 	}
 }
 
-type testCase64 struct {
+func testBasicEncodeDecodeInt64(enc func([]byte, int64) []byte,
+	dec func([]byte) ([]byte, int64), decreasing bool, t *testing.T) {
+	testCases := []int64{
+		math.MinInt64, math.MinInt64 + 1,
+		-1<<56 - 1, -1 << 56,
+		-1<<48 - 1, -1 << 48,
+		-1<<40 - 1, -1 << 40,
+		-1<<32 - 1, -1 << 32,
+		-1<<24 - 1, -1 << 24,
+		-1<<16 - 1, -1 << 16,
+		-1<<8 - 1, -1 << 8,
+		-1, 0, 1,
+		1<<8 - 1, 1 << 8,
+		1<<16 - 1, 1 << 16,
+		1<<24 - 1, 1 << 24,
+		1<<32 - 1, 1 << 32,
+		1<<40 - 1, 1 << 40,
+		1<<48 - 1, 1 << 48,
+		1<<56 - 1, 1 << 56,
+		math.MaxInt64 - 1, math.MaxInt64,
+	}
+
+	var lastEnc []byte
+	for i, v := range testCases {
+		enc := enc(nil, v)
+		if i > 0 {
+			if (decreasing && bytes.Compare(enc, lastEnc) >= 0) ||
+				(!decreasing && bytes.Compare(enc, lastEnc) < 0) {
+				t.Errorf("ordered constraint violated for %d: [% x] vs. [% x]", v, enc, lastEnc)
+			}
+		}
+		b, decode := dec(enc)
+		if len(b) != 0 {
+			t.Errorf("leftover bytes: [% x]", b)
+		}
+		if decode != v {
+			t.Errorf("decode yielded different value than input: %d vs. %d", decode, v)
+		}
+		lastEnc = enc
+	}
+}
+
+type testCaseInt64 struct {
+	value  int64
+	expEnc []byte
+}
+
+func testCustomEncodeInt64(testCases []testCaseInt64,
+	enc func([]byte, int64) []byte, t *testing.T) {
+	for _, test := range testCases {
+		enc := enc(nil, test.value)
+		if bytes.Compare(enc, test.expEnc) != 0 {
+			t.Errorf("expected [% x]; got [% x]", test.expEnc, enc)
+		}
+	}
+}
+
+type testCaseUint64 struct {
 	value  uint64
 	expEnc []byte
 }
 
-func testCustomEncode64(testCases []testCase64, enc func([]byte, uint64) []byte, t *testing.T) {
+func testCustomEncodeUint64(testCases []testCaseUint64,
+	enc func([]byte, uint64) []byte, t *testing.T) {
 	for _, test := range testCases {
 		enc := enc(nil, test.value)
 		if bytes.Compare(enc, test.expEnc) != 0 {
-			t.Errorf("expected %s; got %s", test.expEnc, enc)
+			t.Errorf("expected [% x]; got [% x]", test.expEnc, enc)
 		}
 	}
 }
 
 func TestEncodeDecodeUint64(t *testing.T) {
-	testBasicEncodeDecode64(EncodeUint64, DecodeUint64, false, t)
-	testCases := []testCase64{
+	testBasicEncodeDecodeUint64(EncodeUint64, DecodeUint64, false, t)
+	testCases := []testCaseUint64{
 		{0, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
 		{1, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}},
 		{1 << 8, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00}},
 		{math.MaxUint64, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
 	}
-	testCustomEncode64(testCases, EncodeUint64, t)
+	testCustomEncodeUint64(testCases, EncodeUint64, t)
 }
 
 func TestEncodeDecodeUint64Decreasing(t *testing.T) {
-	testBasicEncodeDecode64(EncodeUint64Decreasing, DecodeUint64Decreasing, true, t)
-	testCases := []testCase64{
+	testBasicEncodeDecodeUint64(EncodeUint64Decreasing, DecodeUint64Decreasing, true, t)
+	testCases := []testCaseUint64{
 		{0, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
 		{1, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe}},
 		{1 << 8, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff}},
 		{math.MaxUint64, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
 	}
-	testCustomEncode64(testCases, EncodeUint64Decreasing, t)
+	testCustomEncodeUint64(testCases, EncodeUint64Decreasing, t)
 }
 
-func TestEncodeDecodeVarUint64(t *testing.T) {
-	testBasicEncodeDecode64(EncodeVarUint64, DecodeVarUint64, false, t)
-	testCases := []testCase64{
-		{0, []byte{0x00}},
-		{1, []byte{0x01, 0x01}},
-		{1 << 8, []byte{0x02, 0x01, 0x00}},
-		{math.MaxUint64, []byte{0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+func TestEncodeDecodeVarint(t *testing.T) {
+	testBasicEncodeDecodeInt64(EncodeVarint, DecodeVarint, false, t)
+	testCases := []testCaseInt64{
+		{math.MinInt64, []byte{0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+		{math.MinInt64 + 1, []byte{0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}},
+		{-1 << 8, []byte{0x06, 0xff, 0x00}},
+		{-1, []byte{0x07, 0xff}},
+		{0, []byte{0x08}},
+		{1, []byte{0x09, 0x01}},
+		{1 << 8, []byte{0x0a, 0x01, 0x00}},
+		{math.MaxInt64, []byte{0x10, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
 	}
-	testCustomEncode64(testCases, EncodeVarUint64, t)
+	testCustomEncodeInt64(testCases, EncodeVarint, t)
 }
 
-func TestEncodeDecodeVarUint64Decreasing(t *testing.T) {
-	testBasicEncodeDecode64(EncodeVarUint64Decreasing, DecodeVarUint64Decreasing, true, t)
-	testCases := []testCase64{
-		{0, []byte{0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
-		{1, []byte{0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe}},
-		{1 << 8, []byte{0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff}},
-		{math.MaxUint64 - 1, []byte{0x01, 0x01}},
-		{math.MaxUint64, []byte{0x00}},
+func TestEncodeDecodeVarintDecreasing(t *testing.T) {
+	testBasicEncodeDecodeInt64(EncodeVarintDecreasing, DecodeVarintDecreasing, true, t)
+	testCases := []testCaseInt64{
+		{math.MinInt64, []byte{0x10, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+		{math.MinInt64 + 1, []byte{0x10, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe}},
+		{-1 << 8, []byte{0x09, 0xff}},
+		{-1, []byte{0x08}},
+		{0, []byte{0x07, 0xff}},
+		{1, []byte{0x07, 0xfe}},
+		{1 << 8, []byte{0x06, 0xfe, 0xff}},
+		{math.MaxInt64, []byte{0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
 	}
-	testCustomEncode64(testCases, EncodeVarUint64Decreasing, t)
+	testCustomEncodeInt64(testCases, EncodeVarintDecreasing, t)
+}
+
+func TestEncodeDecodeUvarint(t *testing.T) {
+	testBasicEncodeDecodeUint64(EncodeUvarint, DecodeUvarint, false, t)
+	testCases := []testCaseUint64{
+		{0, []byte{0x08}},
+		{1, []byte{0x09, 0x01}},
+		{1 << 8, []byte{0x0a, 0x01, 0x00}},
+		{math.MaxUint64, []byte{0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+	}
+	testCustomEncodeUint64(testCases, EncodeUvarint, t)
+}
+
+func TestEncodeDecodeUvarintDecreasing(t *testing.T) {
+	testBasicEncodeDecodeUint64(EncodeUvarintDecreasing, DecodeUvarintDecreasing, true, t)
+	testCases := []testCaseUint64{
+		{0, []byte{0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
+		{1, []byte{0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe}},
+		{1 << 8, []byte{0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff}},
+		{math.MaxUint64 - 1, []byte{0x09, 0x01}},
+		{math.MaxUint64, []byte{0x08}},
+	}
+	testCustomEncodeUint64(testCases, EncodeUvarintDecreasing, t)
+}
+
+func TestEncodeDecodeBytes(t *testing.T) {
+	testCases := []struct {
+		value   []byte
+		encoded []byte
+	}{
+		{[]byte{0, 1, 'a'}, []byte{0x00, 0xff, 1, 'a', 0x00, 0x01}},
+		{[]byte{0, 'a'}, []byte{0x00, 0xff, 'a', 0x00, 0x01}},
+		{[]byte{0, 0xff, 'a'}, []byte{0x00, 0xff, 0xff, 'a', 0x00, 0x01}},
+		{[]byte{'a'}, []byte{'a', 0x00, 0x01}},
+		{[]byte{'b'}, []byte{'b', 0x00, 0x01}},
+		{[]byte{'b', 0}, []byte{'b', 0x00, 0xff, 0x00, 0x01}},
+		{[]byte{'b', 0, 0}, []byte{'b', 0x00, 0xff, 0x00, 0xff, 0x00, 0x01}},
+		{[]byte{'b', 0, 0, 'a'}, []byte{'b', 0x00, 0xff, 0x00, 0xff, 'a', 0x00, 0x01}},
+		{[]byte{'b', 0xff}, []byte{'b', 0xff, 0x00, 0x01}},
+		{[]byte("hello"), []byte{'h', 'e', 'l', 'l', 'o', 0x00, 0x01}},
+		{[]byte{0xff, 0, 'a'}, []byte{0xff, 0x00, 0x00, 0xff, 'a', 0x00, 0x01}},
+		{[]byte{0xff, 'b'}, []byte{0xff, 0x00, 'b', 0x00, 0x01}},
+		{[]byte{0xff, 0xff, 'b'}, []byte{0xff, 0x00, 0xff, 'b', 0x00, 0x01}},
+	}
+	for i, c := range testCases {
+		enc := EncodeBytes(nil, c.value)
+		if !bytes.Equal(enc, c.encoded) {
+			t.Errorf("unexpected encoding mismatch for %v. expected [% x], got [% x]",
+				c.value, c.encoded, enc)
+		}
+		if i > 0 {
+			if bytes.Compare(testCases[i-1].encoded, enc) >= 0 {
+				t.Errorf("%v: expected [% x] to be less than [% x]",
+					c.value, testCases[i-1].encoded, enc)
+			}
+		}
+		remainder, dec := DecodeBytes(enc)
+		if !bytes.Equal(c.value, dec) {
+			t.Errorf("unexpected decoding mismatch for %v. got %v", c.value, dec)
+		}
+		if len(remainder) != 0 {
+			t.Errorf("unexpected remaining bytes: %v", remainder)
+		}
+
+		enc = append(enc, []byte("remainder")...)
+		remainder, dec = DecodeBytes(enc)
+		if string(remainder) != "remainder" {
+			t.Errorf("unexpected remaining bytes: %v", remainder)
+		}
+	}
+}
+
+func TestDecodeInvalidBytes(t *testing.T) {
+	testCases := []struct {
+		value []byte
+	}{
+		{[]byte{'a'}},             // no terminator
+		{[]byte{'a', 0x00}},       // malformed escape
+		{[]byte{'a', 0x00, 0x00}}, // invalid escape
+		{[]byte{'a', 0x00, 0x02}}, // invalid escape
+	}
+	for _, c := range testCases {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Error("expected panic")
+				}
+			}()
+			DecodeBytes(c.value)
+		}()
+	}
+}
+
+func BenchmarkEncodeUint32(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([]uint32, 10000)
+	for i := range vals {
+		vals[i] = uint32(rng.Int31())
+	}
+
+	buf := make([]byte, 0, 16)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeUint32(buf, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeUint32(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeUint32(nil, uint32(rng.Int31()))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = DecodeUint32(vals[i%len(vals)])
+	}
+}
+
+func BenchmarkEncodeUint64(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([]uint64, 10000)
+	for i := range vals {
+		vals[i] = uint64(rng.Int63())
+	}
+
+	buf := make([]byte, 0, 16)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeUint64(buf, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeUint64(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeUint64(nil, uint64(rng.Int63()))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = DecodeUint64(vals[i%len(vals)])
+	}
+}
+
+func BenchmarkEncodeVarint(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([]int64, 10000)
+	for i := range vals {
+		vals[i] = rng.Int63()
+	}
+
+	buf := make([]byte, 0, 16)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeVarint(buf, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeVarint(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeVarint(nil, rng.Int63())
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = DecodeVarint(vals[i%len(vals)])
+	}
+}
+
+func BenchmarkEncodeUvarint(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([]uint64, 10000)
+	for i := range vals {
+		vals[i] = uint64(rng.Int63())
+	}
+
+	buf := make([]byte, 0, 16)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeUvarint(buf, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeUvarint(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeUvarint(nil, uint64(rng.Int63()))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = DecodeUvarint(vals[i%len(vals)])
+	}
+}
+
+func BenchmarkEncodeBytes(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = util.RandBytes(rng, 100)
+	}
+
+	buf := make([]byte, 0, 1000)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EncodeBytes(buf, vals[i%len(vals)])
+	}
+}
+
+func BenchmarkDecodeBytes(b *testing.B) {
+	rng := util.NewPseudoRand()
+
+	vals := make([][]byte, 10000)
+	for i := range vals {
+		vals[i] = EncodeBytes(nil, util.RandBytes(rng, 100))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = DecodeBytes(vals[i%len(vals)])
+	}
 }

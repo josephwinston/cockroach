@@ -5,26 +5,28 @@
 ### Assumed
  * A working GCC (on mac os x something like `xcode-select --install` will get you started)
  * [Go environment](http://golang.org/doc/code.html)
- * [protoc](https://github.com/google/protobuf/releases)
- * pkgconfig
- * curl
+ * Git and Mercurial (for retrieving dependencies)
 
 If you're on Mac OS X, [homebrew](http://brew.sh/) can be very helpful to fulfill these dependencies.
 
-You can `go get -d github.com/cockroachdb/cockroach` and then run `./bootstrap.sh` or, alternatively,
+You can `go get -d github.com/cockroachdb/cockroach` or, alternatively,
 
 ```bash
 mkdir -p $GOPATH/src/github.com/cockroachdb/
 cd $GOPATH/src/github.com/cockroachdb/
 git clone git@github.com:cockroachdb/cockroach.git
 cd cockroach
-./bootstrap.sh
 ```
 
-Now you should be all set for `make build`, `make test` and everything else our Makefile has to offer.
+Now you should be all set for `make build`, `make test` and everything else our Makefile has to
+offer. Note that the first time you run `make` various dependent libraries and tools will be
+downloaded and installed which can be somewhat time consuming. Be patient.
 
 Note that if you edit a `.proto` file you will need to manually regenerate the associated
 `.pb.{go,cc,h}` files using `go generate`.
+
+To add or update a dependency, use `go get -u` and then
+`glock save github.com/cockroachdb/cockroach` and commit the changes to the GLOCKFILE.
 
 ### Style guide
 We're following the [Google Go Code Review](https://code.google.com/p/go-wiki/wiki/CodeReviewComments) fairly closely. In particular, you want to watch out for proper punctuation and capitalization and make sure that your lines stay well below 80 characters.

@@ -15,12 +15,14 @@
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-package proto;
+syntax = "proto2";
+package cockroach.proto;
+option go_package = "proto";
 
-import "config.proto";
-import "data.proto";
-import "errors.proto";
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "cockroach/proto/config.proto";
+import "cockroach/proto/data.proto";
+import "cockroach/proto/errors.proto";
+import "gogoproto/gogo.proto";
 
 // ClientCmdID provides a unique ID for client commands. Clients which
 // provide ClientCmdID gain operation idempotence. In other words,
@@ -232,8 +234,7 @@ message EndTransactionRequest {
   // Optional commit triggers. Note that commit triggers are for
   // internal use only and will be ignored if requested through the
   // public-facing KV API.
-  optional SplitTrigger split_trigger = 3;
-  optional MergeTrigger merge_trigger = 4;
+  optional InternalCommitTrigger internal_commit_trigger = 3;
 }
 
 // An EndTransactionResponse is the return value from the

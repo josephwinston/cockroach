@@ -173,12 +173,7 @@ func WillOverflow(a, b int64) bool {
 // representation. The bytes are appended to the supplied buffer and
 // the final buffer is returned.
 func EncodeUint32(b []byte, v uint32) []byte {
-	enc := make([]byte, 4)
-	for i := 3; i >= 0; i-- {
-		enc[i] = byte(v & 0xff)
-		v >>= 8
-	}
-	return append(b, enc...)
+	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
 // EncodeUint32Decreasing encodes the uint32 value so that it sorts in
@@ -194,10 +189,8 @@ func DecodeUint32(b []byte) ([]byte, uint32) {
 	if len(b) < 4 {
 		panic("insufficient bytes to decode uint32 int value")
 	}
-	var v uint32
-	for i := 0; i < 4; i++ {
-		v = (v << 8) | uint32(b[i])
-	}
+	v := (uint32(b[0]) << 24) | (uint32(b[1]) << 16) |
+		(uint32(b[2]) << 8) | uint32(b[3])
 	return b[4:], v
 }
 
@@ -212,12 +205,9 @@ func DecodeUint32Decreasing(b []byte) ([]byte, uint32) {
 // representation. The bytes are appended to the supplied buffer and
 // the final buffer is returned.
 func EncodeUint64(b []byte, v uint64) []byte {
-	enc := make([]byte, 8)
-	for i := 7; i >= 0; i-- {
-		enc[i] = byte(v & 0xff)
-		v >>= 8
-	}
-	return append(b, enc...)
+	return append(b,
+		byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+		byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
 // EncodeUint64Decreasing encodes the uint64 value so that it sorts in
@@ -233,10 +223,10 @@ func DecodeUint64(b []byte) ([]byte, uint64) {
 	if len(b) < 8 {
 		panic("insufficient bytes to decode uint64 int value")
 	}
-	var v uint64
-	for i := 0; i < 8; i++ {
-		v = (v << 8) | uint64(b[i])
-	}
+	v := (uint64(b[0]) << 56) | (uint64(b[1]) << 48) |
+		(uint64(b[2]) << 40) | (uint64(b[3]) << 32) |
+		(uint64(b[4]) << 24) | (uint64(b[5]) << 16) |
+		(uint64(b[6]) << 8) | uint64(b[7])
 	return b[8:], v
 }
 
@@ -247,53 +237,241 @@ func DecodeUint64Decreasing(b []byte) ([]byte, uint64) {
 	return leftover, ^v
 }
 
-// EncodeVarUint64 encodes the uint64 value using a variable length
-// (length-prefixed) big-endian 8 byte representation. The bytes are
-// appended to the supplied buffer and the final buffer is returned.
-func EncodeVarUint64(b []byte, v uint64) []byte {
-	enc := make([]byte, 9)
-	var length int
-	for v > 0 {
-		enc[length+1] = byte(v & 0xff)
-		length++
-		v >>= 8
+// EncodeVarint encodes the int64 value using a variable length
+// (length-prefixed) representation. The length is encoded as a single
+// byte. If the value to be encoded is negative the length is encoded
+// as 8-numBytes. If the value is positive it is encoded as
+// 8+numBytes. The encoded bytes are appended to the supplied buffer
+// and the final buffer is returned.
+func EncodeVarint(b []byte, v int64) []byte {
+	if v < 0 {
+		switch {
+		case v >= -0xff:
+			return append(b, 7, byte(v))
+		case v >= -0xffff:
+			return append(b, 6, byte(v>>8), byte(v))
+		case v >= -0xffffff:
+			return append(b, 5, byte(v>>16), byte(v>>8), byte(v))
+		case v >= -0xffffffff:
+			return append(b, 4, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+		case v >= -0xffffffffff:
+			return append(b, 3, byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8),
+				byte(v))
+		case v >= -0xffffffffffff:
+			return append(b, 2, byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16),
+				byte(v>>8), byte(v))
+		case v >= -0xffffffffffffff:
+			return append(b, 1, byte(v>>48), byte(v>>40), byte(v>>32), byte(v>>24),
+				byte(v>>16), byte(v>>8), byte(v))
+		default:
+			return append(b, 0, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+				byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+		}
 	}
-	// Reverse the bytes.
-	for i := 0; i < length/2; i++ {
-		enc[i+1], enc[length-i] = enc[length-i], enc[i+1]
-	}
-	enc[0] = byte(length)
-	return append(b, enc[:length+1]...)
+
+	return EncodeUvarint(b, uint64(v))
 }
 
-// EncodeVarUint64Decreasing encodes the uint64 value so that it sorts in
+// EncodeVarintDecreasing encodes the uint64 value so that it sorts in
 // reverse order, from largest to smallest.
-func EncodeVarUint64Decreasing(b []byte, v uint64) []byte {
-	return EncodeVarUint64(b, ^v)
+func EncodeVarintDecreasing(b []byte, v int64) []byte {
+	return EncodeVarint(b, ^v)
 }
 
-// DecodeVarUint64 decodes a uint64 from the input buffer, treating
-// the input as a big-endian 8 byte uint64 representation. The remainder
-// of the input buffer and the decoded uint64 are returned.
-func DecodeVarUint64(b []byte) ([]byte, uint64) {
+// DecodeVarint decodes a varint encoded int64 from the input
+// buffer. The remainder of the input buffer and the decoded int64
+// are returned.
+func DecodeVarint(b []byte) ([]byte, int64) {
 	if len(b) == 0 {
 		panic("insufficient bytes to decode var uint64 int value")
 	}
-	length := int(b[0])
+	length := int(b[0]) - 8
+	if length < 0 {
+		length = -length
+		b = b[1:]
+		if len(b) < length {
+			panic(fmt.Sprintf("insufficient bytes to decode var uint64 int value: %s", b))
+		}
+		var v int64
+		// Use the ones-complement of each encoded byte in order to build
+		// up a positive number, then take the ones-complement again to
+		// arrive at our negative value.
+		for _, t := range b[:length] {
+			v = (v << 8) | int64(^t)
+		}
+		return b[length:], ^v
+	}
+
+	b, v := DecodeUvarint(b)
+	return b, int64(v)
+}
+
+// DecodeVarintDecreasing decodes a uint64 value which was encoded
+// using EncodeVarintDecreasing.
+func DecodeVarintDecreasing(b []byte) ([]byte, int64) {
+	leftover, v := DecodeVarint(b)
+	return leftover, ^v
+}
+
+// EncodeUvarint encodes the uint64 value using a variable length
+// (length-prefixed) representation. The length is encoded as a single
+// byte indicating the number of encoded bytes (-8) to follow. See
+// EncodeVarint for rationale. The encoded bytes are appended to the
+// supplied buffer and the final buffer is returned.
+func EncodeUvarint(b []byte, v uint64) []byte {
+	switch {
+	case v == 0:
+		return append(b, 8)
+	case v <= 0xff:
+		return append(b, 9, byte(v))
+	case v <= 0xffff:
+		return append(b, 10, byte(v>>8), byte(v))
+	case v <= 0xffffff:
+		return append(b, 11, byte(v>>16), byte(v>>8), byte(v))
+	case v <= 0xffffffff:
+		return append(b, 12, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	case v <= 0xffffffffff:
+		return append(b, 13, byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8),
+			byte(v))
+	case v <= 0xffffffffffff:
+		return append(b, 14, byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16),
+			byte(v>>8), byte(v))
+	case v <= 0xffffffffffffff:
+		return append(b, 15, byte(v>>48), byte(v>>40), byte(v>>32), byte(v>>24),
+			byte(v>>16), byte(v>>8), byte(v))
+	default:
+		return append(b, 16, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+			byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	}
+}
+
+// EncodeUvarintDecreasing encodes the uint64 value so that it sorts in
+// reverse order, from largest to smallest.
+func EncodeUvarintDecreasing(b []byte, v uint64) []byte {
+	return EncodeUvarint(b, ^v)
+}
+
+// DecodeUvarint decodes a varint encoded uint64 from the input
+// buffer. The remainder of the input buffer and the decoded uint64
+// are returned.
+func DecodeUvarint(b []byte) ([]byte, uint64) {
+	if len(b) == 0 {
+		panic("insufficient bytes to decode var uint64 int value")
+	}
+	length := int(b[0]) - 8
+	if length < 0 {
+		panic(fmt.Sprintf("unable to decode negative value into uint64: %d", length))
+	}
 	b = b[1:] // skip length byte
 	if len(b) < length {
 		panic(fmt.Sprintf("insufficient bytes to decode var uint64 int value: %s", b))
 	}
 	var v uint64
-	for i := 0; i < length; i++ {
-		v = (v << 8) | uint64(b[i])
+	// It is faster to range over the elements in a slice than to index
+	// into the slice on each loop iteration.
+	for _, t := range b[:length] {
+		v = (v << 8) | uint64(t)
 	}
 	return b[length:], v
 }
 
-// DecodeVarUint64Decreasing decodes a uint64 value which was encoded
-// using EncodeVarUint64Decreasing.
-func DecodeVarUint64Decreasing(b []byte) ([]byte, uint64) {
-	leftover, v := DecodeVarUint64(b)
+// DecodeUvarintDecreasing decodes a uint64 value which was encoded
+// using EncodeUvarintDecreasing.
+func DecodeUvarintDecreasing(b []byte) ([]byte, uint64) {
+	leftover, v := DecodeUvarint(b)
 	return leftover, ^v
+}
+
+const (
+	// <term>     -> \x00\x01
+	// \x00       -> \x00\xff
+	// \xff       -> \xff\x00
+	// <infinity> -> \xff\xff
+	escape1     = 0x00
+	escape2     = 0xff
+	escapedTerm = 0x01
+	escapedNul  = 0xff
+	escapedFF   = 0x00
+)
+
+var (
+	// Infinity compares greater than every other encoded value.
+	Infinity = []byte{0xff, 0xff}
+)
+
+// EncodeBytes encodes the []byte value using an escape-based
+// encoding. The encoded value is terminated with the sequence
+// "\x00\x01" which is guaranteed to not occur elsewhere in the
+// encoded value. The encoded bytes are append to the supplied buffer
+// and the resulting buffer is returned.
+//
+// The encoded data is guaranteed to compare less than the Infinity
+// symbol \xff\xff. This is accomplished by transforming \xff to
+// \xff\x00 when it occurs at the beginning of the bytes to encode.
+func EncodeBytes(b []byte, data []byte) []byte {
+	if len(data) > 0 && data[0] == escape2 {
+		b = append(b, escape2, escapedFF)
+		data = data[1:]
+	}
+
+	for {
+		// IndexByte is implemented by the go runtime in assembly and is
+		// much faster than looping over the bytes in the slice.
+		i := bytes.IndexByte(data, escape1)
+		if i == -1 {
+			break
+		}
+		b = append(b, data[:i]...)
+		b = append(b, escape1, escapedNul)
+		data = data[i+1:]
+	}
+	b = append(b, data...)
+	return append(b, escape1, escapedTerm)
+}
+
+// DecodeBytes decodes a []byte value from the input buffer which was
+// encoded using EncodeBytes. The remainder of the input buffer and
+// the decoded []byte are returned.
+func DecodeBytes(b []byte) ([]byte, []byte) {
+	var r []byte
+
+	if len(b) > 0 && b[0] == escape2 {
+		if len(b) == 1 {
+			panic("malformed escape")
+		}
+		if b[1] != escapedFF {
+			panic("unknown escape")
+		}
+		r = append(r, 0xff)
+		b = b[2:]
+	}
+
+	for {
+		i := bytes.IndexByte(b, escape1)
+		if i == -1 {
+			panic("did not find terminator")
+		}
+		if i+1 > len(b) {
+			panic("malformed escape")
+		}
+
+		v := b[i+1]
+		if v == escapedTerm {
+			if r == nil {
+				r = b[:i]
+			} else {
+				r = append(r, b[:i]...)
+			}
+			return b[i+2:], r
+		}
+
+		if v == escapedNul {
+			r = append(r, b[:i]...)
+			r = append(r, 0)
+		} else {
+			panic("unknown escape")
+		}
+
+		b = b[i+2:]
+	}
 }

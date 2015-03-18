@@ -434,6 +434,8 @@ func TestMVCCGetAndDelete(t *testing.T) {
 
 func TestMVCCDeleteMissingKey(t *testing.T) {
 	engine := NewInMem(proto.Attributes{}, 1<<20)
+	defer engine.Stop()
+
 	if err := MVCCDelete(engine, nil, testKey1, makeTS(1, 0), nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1222,6 +1224,8 @@ func TestValidSplitKeys(t *testing.T) {
 func TestFindSplitKey(t *testing.T) {
 	raftID := int64(1)
 	engine := NewInMem(proto.Attributes{}, 1<<20)
+	defer engine.Stop()
+
 	ms := &MVCCStats{}
 	// Generate a series of KeyValues, each containing targetLength
 	// bytes, writing key #i to (encoded) key #i through the MVCC
@@ -1329,6 +1333,8 @@ func TestFindValidSplitKeys(t *testing.T) {
 
 	for i, test := range testCases {
 		engine := NewInMem(proto.Attributes{}, 1<<20)
+		defer engine.Stop()
+
 		ms := &MVCCStats{}
 		val := proto.Value{Bytes: []byte(strings.Repeat("X", 10))}
 		for _, k := range test.keys {
@@ -1407,6 +1413,8 @@ func TestFindBalancedSplitKeys(t *testing.T) {
 
 	for i, test := range testCases {
 		engine := NewInMem(proto.Attributes{}, 1<<20)
+		defer engine.Stop()
+
 		ms := &MVCCStats{}
 		var expKey proto.Key
 		for j, keySize := range test.keySizes {
@@ -1635,7 +1643,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 		// Same for aggregate gc'able bytes age.
 		ms.GCBytesAge += ms.KeyBytes + ms.ValBytes - ms.LiveBytes
 
-		key := []byte(fmt.Sprintf("%s-%d", util.RandString(rng, int(rng.Int31n(32))), i))
+		key := []byte(fmt.Sprintf("%s-%d", util.RandBytes(rng, int(rng.Int31n(32))), i))
 		keys[i] = key
 		var txn *proto.Transaction
 		if rng.Int31n(2) == 0 { // create a txn with 50% prob
@@ -1667,7 +1675,7 @@ func TestMVCCStatsWithRandomRuns(t *testing.T) {
 				}
 			}
 		} else {
-			rngVal := proto.Value{Bytes: []byte(util.RandString(rng, int(rng.Int31n(128))))}
+			rngVal := proto.Value{Bytes: util.RandBytes(rng, int(rng.Int31n(128)))}
 			log.V(1).Infof("*** PUT index %d; TXN=%t", i, txn != nil)
 			if err := MVCCPut(engine, ms, key, makeTS(int64(i+1)*1E9, 0), rngVal, txn); err != nil {
 				t.Fatal(err)

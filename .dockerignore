@@ -1,9 +1,8 @@
-_vendor
 cockroach
-build/deploy
 .git/FETCH_HEAD
 .git/modules
 *.test
 */*.test
 */*/*.test
 */*/*/*.test
+storage/engine/mvcc_scan_*

@@ -23,12 +23,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
 	"reflect"
 	"sort"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util"
@@ -52,30 +50,15 @@ func ensureRangeEqual(t *testing.T, sortedKeys []string, keyMap map[string][]byt
 }
 
 var (
-	inMemAttrs   = proto.Attributes{Attrs: []string{"mem"}}
-	rocksDBAttrs = proto.Attributes{Attrs: []string{"ssd"}}
+	inMemAttrs = proto.Attributes{Attrs: []string{"mem"}}
 )
 
 // runWithAllEngines creates a new engine of each supported type and
 // invokes the supplied test func with each instance.
 func runWithAllEngines(test func(e Engine, t *testing.T), t *testing.T) {
-	inMem := NewInMem(inMemAttrs, 10<<20)
-
-	loc := fmt.Sprintf("%s/data_%d", os.TempDir(), time.Now().UnixNano())
-	rocksdb := NewRocksDB(rocksDBAttrs, loc, testCacheSize)
-	err := rocksdb.Start()
-	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", loc, err)
-	}
-	defer func(t *testing.T) {
-		rocksdb.Stop()
-		if err := rocksdb.Destroy(); err != nil {
-			t.Errorf("could not delete rocksdb db at %s: %v", loc, err)
-		}
-	}(t)
-
+	inMem := NewInMem(inMemAttrs, testCacheSize)
+	defer inMem.Stop()
 	test(inMem, t)
-	test(rocksdb, t)
 }
 
 // TestEngineWriteBatch writes a batch containing 10K rows (all the
@@ -563,8 +546,6 @@ func TestSnapshotMethods(t *testing.T) {
 		switch engine.(type) {
 		case *InMem:
 			attrs = inMemAttrs
-		case *RocksDB:
-			attrs = rocksDBAttrs
 		}
 		if !reflect.DeepEqual(engine.Attrs(), attrs) {
 			t.Errorf("attrs mismatch; expected %+v, got %+v", attrs, engine.Attrs())
@@ -713,15 +694,13 @@ func TestApproximateSize(t *testing.T) {
 		)
 		for i := 0; i < count; i++ {
 			keys[i] = []byte(fmt.Sprintf("key%8d", i))
-			values[i] = []byte(util.RandString(rand, valueLen))
+			values[i] = util.RandBytes(rand, valueLen)
 		}
 
 		insertKeysAndValues(keys, values, engine, t)
-		if rocksdb, ok := engine.(*RocksDB); ok {
-			err := rocksdb.Flush()
-			if err != nil {
-				t.Fatalf("Error flushing RocksDB: %s", err.Error())
-			}
+
+		if err := engine.Flush(); err != nil {
+			t.Fatalf("Error flushing InMem: %s", err)
 		}
 
 		sizePerRecord := (len([]byte(keys[0])) + valueLen)

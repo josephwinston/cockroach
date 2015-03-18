@@ -2,7 +2,7 @@
 
 ## A Scalable, Geo-Replicated, Transactional Datastore
 
-<img align="right" src="/resources/doc/color_cockroach.png?raw=true"/>
+<img align="right" src="/resource/doc/color_cockroach.png?raw=true"/>
 
 **Table of Contents**
 
@@ -13,7 +13,7 @@
 - [Design](#design) and [Datastore Goal Articulation](#datastore-goal-articulation)
 - [Architecture](#architecture) and [Client Architecture](#client-architecture)
 
-[![WIRED on CockroachDB](/resources/doc/wired-preview.png?raw=true)](http://www.wired.com/2014/07/cockroachdb/)
+[![WIRED on CockroachDB](/resource/doc/wired-preview.png?raw=true)](http://www.wired.com/2014/07/cockroachdb/)
 
 ## Status
 
@@ -46,10 +46,9 @@ If you don't want to use Docker,
 ```bash
 $ docker run -d -p 8080:8080 "cockroachdb/cockroach" \
     init -rpc="localhost:0" \
-    -certs="resources/test_certs" \
-    -stores="ssd=/tmp/db"
+    -stores="ssd=$(mktemp -d)"
 ```
-This bootstraps and starts a single node with one temporary RocksDB instance at /tmp/db in the background (remove the `-d` flag if you want to see stdout).
+This bootstraps and starts a single node with one temporary RocksDB instance in the background (remove the `-d` flag if you want to see stdout).
 Now let's talk to this node. You can use the [REST Explorer at
 localhost:8080](http://localhost:8080) or talk directly to the API:
 ```bash
@@ -106,9 +105,11 @@ See [CONTRIBUTING.md](https://github.com/cockroachdb/cockroach/blob/master/CONTR
 For full design details, see the [original design doc](https://docs.google.com/document/d/11k2EmhLGSbViBvi6_zFEiKzuXxYF49ZuuDJLe6O8gBU/edit?usp=sharing).
 
 For a quick design overview, see the [Cockroach tech talk slides](https://docs.google.com/presentation/d/1e3TOxImRg6_nyMZspXvzb2u43D6gnS5422vAIN7J1n8/edit?usp=sharing)
-or watch a presentation of the tech talk
-* [at Yelp!](http://www.youtube.com/watch?v=MEAuFgsmND0&feature=youtu.be) by [Spencer Kimball](https://github.com/spencerkimball) (9/5/2014)
-* [at the NoSQL User Group Cologne](https://www.youtube.com/watch?v=jI3LiKhqN0E) by [Tobias Schottdorf](https://github.com/tschottdorf) (11/5/2014).
+or watch a presentation:
+* [Venue: Yelp!](http://www.youtube.com/watch?v=MEAuFgsmND0&feature=youtu.be), Presented by [Spencer Kimball](https://github.com/spencerkimball) on (9/5/2014).
+* [Venue: The NoSQL User Group Cologne](https://www.youtube.com/watch?v=jI3LiKhqN0E), Presented by [Tobias Schottdorf](https://github.com/tschottdorf) on (11/5/2014).
+* [Venue: The Go Devroom FOSDEM 2015](https://www.youtube.com/watch?v=ndKj77VW2eM&index=2&list=PLtLJO5JKE5YDK74RZm67xfwaDgeCj7oqb), Presented by [Tobias Schottdorf](https://github.com/tschottdorf) on (03/04/2015).
+
 
 Cockroach is a distributed key/value datastore which supports ACID
 transactional semantics and versioned values as first-class
@@ -171,7 +172,7 @@ communication between distributed system components.
 
 #### SQL - NoSQL - NewSQL Capabilities
 
-![SQL - NoSQL - NewSQL Capabilities](/resources/doc/sql-nosql-newsql.png?raw=true)
+![SQL - NoSQL - NewSQL Capabilities](/resource/doc/sql-nosql-newsql.png?raw=true)
 
 ## Datastore Goal Articulation
 
@@ -202,7 +203,7 @@ controlling physical order in different systems.
   hash-bucketing, primarily based on the Dynamo design. (Cassandra,
   Riak)
 
-![Datastore Scan Efficiency Spectrum](/resources/doc/scan-efficiency.png?raw=true)
+![Datastore Scan Efficiency Spectrum](/resource/doc/scan-efficiency.png?raw=true)
 
 #### Read vs. Write Optimization Spectrum
 
@@ -238,7 +239,7 @@ CouchDB), hybrid stores are read-optimized with better
 write-throughput (Tokutek MySQL/MongoDB), while LSM-variants are
 write-optimized (HBase, Cassandra, SQLite3/LSM, Cockroach).
 
-![Read vs. Write Optimization Spectrum](/resources/doc/read-vs-write.png?raw=true)
+![Read vs. Write Optimization Spectrum](/resource/doc/read-vs-write.png?raw=true)
 
 ## Architecture
 
@@ -255,7 +256,7 @@ with any number of [cockroach nodes][9] ([server/][10]), storing the actual
 data. Each node contains one or more [stores][11] ([storage/][12]), one per
 physical device.
 
-![Cockroach Architecture](/resources/doc/architecture.png?raw=true)
+![Cockroach Architecture](/resource/doc/architecture.png?raw=true)
 
 Each store contains potentially many ranges, the lowest-level unit of
 key-value data. Ranges are replicated using the [Raft][2] consensus
@@ -264,7 +265,7 @@ of the five nodes in the previous diagram. Each range is replicated
 three ways using raft. The color coding shows associated range
 replicas.
 
-![Range Architecture Blowup](/resources/doc/architecture-blowup.png?raw=true)
+![Range Architecture Blowup](/resource/doc/architecture-blowup.png?raw=true)
 
 ## Client Architecture
 
@@ -300,7 +301,7 @@ eschews the HTTP sender and instead directly shares the transaction
 coordinator and distributed sender used by the REST and DB client
 gateways.
 
-![Client Architecture](/resources/doc/client-architecture.png?raw=true)
+![Client Architecture](/resource/doc/client-architecture.png?raw=true)
 
 [0]: http://rocksdb.org/
 [1]: https://code.google.com/p/leveldb/

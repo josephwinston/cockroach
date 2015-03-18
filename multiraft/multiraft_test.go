@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -31,7 +32,7 @@ import (
 var testRand = util.NewPseudoRand()
 
 func makeCommandID() string {
-	return util.RandString(testRand, commandIDLen)
+	return string(util.RandBytes(testRand, commandIDLen))
 }
 
 type testCluster struct {
@@ -104,11 +105,13 @@ func (c *testCluster) createGroup(groupID uint64, firstNode, numReplicas int) {
 	for i := 0; i < numReplicas; i++ {
 		gs := c.storages[firstNode+i].GroupStorage(groupID)
 		memStorage := gs.(*blockableGroupStorage).s.(*raft.MemoryStorage)
-		memStorage.SetHardState(raftpb.HardState{
+		if err := memStorage.SetHardState(raftpb.HardState{
 			Commit: 10,
 			Term:   5,
-		})
-		memStorage.ApplySnapshot(raftpb.Snapshot{
+		}); err != nil {
+			c.t.Fatal(err)
+		}
+		if err := memStorage.ApplySnapshot(raftpb.Snapshot{
 			Metadata: raftpb.SnapshotMetadata{
 				ConfState: raftpb.ConfState{
 					Nodes: replicaIDs,
@@ -116,7 +119,9 @@ func (c *testCluster) createGroup(groupID uint64, firstNode, numReplicas int) {
 				Index: 10,
 				Term:  5,
 			},
-		})
+		}); err != nil {
+			c.t.Fatal(err)
+		}
 
 		node := c.nodes[firstNode+i]
 		err := node.CreateGroup(groupID)
@@ -148,6 +153,7 @@ func (c *testCluster) waitForElection(i int) *EventLeaderElection {
 }
 
 func TestInitialLeaderElection(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	// Run the test three times, each time triggering a different node's election clock.
 	// The node that requests an election first should win.
 	for leaderIndex := 0; leaderIndex < 3; leaderIndex++ {
@@ -170,6 +176,7 @@ func TestInitialLeaderElection(t *testing.T) {
 }
 
 func TestLeaderElectionEvent(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	// Leader election events are fired when the leader commits an entry, not when it
 	// issues a call for votes.
 	cluster := newTestCluster(nil, 3, t)
@@ -223,6 +230,7 @@ func TestLeaderElectionEvent(t *testing.T) {
 }
 
 func TestCommand(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	cluster := newTestCluster(nil, 3, t)
 	defer cluster.stop()
 	groupID := uint64(1)
@@ -244,6 +252,7 @@ func TestCommand(t *testing.T) {
 }
 
 func TestSlowStorage(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	cluster := newTestCluster(nil, 3, t)
 	defer cluster.stop()
 	groupID := uint64(1)
@@ -289,6 +298,7 @@ func TestSlowStorage(t *testing.T) {
 }
 
 func TestMembershipChange(t *testing.T) {
+	defer leaktest.AfterTest(t)
 	cluster := newTestCluster(nil, 4, t)
 	defer cluster.stop()
 
@@ -298,11 +308,24 @@ func TestMembershipChange(t *testing.T) {
 	cluster.triggerElection(0)
 	cluster.waitForElection(0)
 
+	// Consume and apply the membership change events.
+	for i := 0; i < 4; i++ {
+		go func(i int) {
+			for {
+				e, ok := <-cluster.events[i].MembershipChangeCommitted
+				if !ok {
+					return
+				}
+				e.Callback(nil)
+			}
+		}(i)
+	}
+
 	// Add each of the other three nodes to the cluster.
 	for i := 1; i < 4; i++ {
 		ch := cluster.nodes[0].ChangeGroupMembership(groupID, makeCommandID(),
 			raftpb.ConfChangeAddNode,
-			cluster.nodes[i].nodeID)
+			cluster.nodes[i].nodeID, nil)
 		<-ch
 	}
 

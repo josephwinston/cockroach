@@ -15,12 +15,14 @@
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-package proto;
+syntax = "proto2";
+package cockroach.proto;
+option go_package = "proto";
 
-import "api.proto";
-import "config.proto";
-import "data.proto";
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "cockroach/proto/api.proto";
+import "cockroach/proto/config.proto";
+import "cockroach/proto/data.proto";
+import "gogoproto/gogo.proto";
 
 // An InternalRangeLookupRequest is arguments to the
 // InternalRangeLookup() method. It specifies the key for which the
@@ -66,7 +68,7 @@ message InternalHeartbeatTxnResponse {
 // MVCC values.
 message InternalGCRequest {
   optional RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  optional ScanMetadata scan_meta = 2 [(gogoproto.nullable) = false];
+  optional GCMetadata gc_meta = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "GCMeta"];
 
   message GCKey {
     optional bytes key = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "Key"];
@@ -161,34 +163,6 @@ message InternalTruncateLogResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
-// ReplicaChangeType is a parameter of InternalChangeReplicasRequest.
-enum ReplicaChangeType {
-  option (gogoproto.goproto_enum_prefix) = false;
-  ADD_REPLICA = 0;
-  REMOVE_REPLICA = 1;
-}
-
-// InternalChangeReplicasRequest is used to add or remove a replica from a raft group.
-// Only one ChangeReplicas operation can be in progress at a time; a proposed
-// change will fail if the previous change has not yet completed.
-message InternalChangeReplicasRequest {
-  optional RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  optional int32 node_id = 2 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "NodeID", (gogoproto.customtype) = "NodeID"];
-  optional int32 store_id = 3 [(gogoproto.nullable) = false,
-      (gogoproto.customname) = "StoreID", (gogoproto.customtype) = "StoreID"];
-  optional ReplicaChangeType change_type = 4 [(gogoproto.nullable) = false];
-
-  // This field gets filled in as the request passes through raft.
-  // It contains the current committed members of the group (equivalent to ConfState.Nodes)
-  // to guard against any drift from incremental processing of changes.
-  repeated uint64 nodes = 5;
-}
-
-message InternalChangeReplicasResponse {
-  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-}
-
 // A ReadWriteCmdResponse is a union type containing instances of all
 // mutating commands. Note that any entry added here must be handled
 // in storage/engine/db.cc in GetResponseHeader().
@@ -239,7 +213,6 @@ message InternalRaftCommandUnion {
   optional InternalMergeRequest internal_merge_response = 35;
   optional InternalTruncateLogRequest internal_truncate_log = 36;
   optional InternalGCRequest internal_gc = 37;
-  optional InternalChangeReplicasRequest internal_change_replicas = 38;
 }
 
 // An InternalRaftCommand is a command which can be serialized and
@@ -340,4 +313,14 @@ message InternalTimeSeriesSample {
     optional float float_max = 8;
     // Minimum encountered floating point measurement in this sample.
     optional float float_min = 9;
+}
+
+// RaftTruncatedState contains metadata about the truncated portion of the raft log.
+// Raft requires access to the term of the last truncated log entry even after the
+// rest of the entry has been discarded.
+message RaftTruncatedState {
+  // The highest index that has been removed from the log.
+  optional uint64 index = 1 [(gogoproto.nullable) = false];
+  // The term corresponding to 'index'.
+  optional uint64 term = 2 [(gogoproto.nullable) = false];
 }

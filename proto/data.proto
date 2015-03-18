@@ -16,14 +16,17 @@
 // Author: Jiajia Han (hanjia18@gmail.com)
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-package proto;
+syntax = "proto2";
+package cockroach.proto;
+option go_package = "proto";
 
-import "config.proto";
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "cockroach/proto/config.proto";
+import "gogoproto/gogo.proto";
 
 // Timestamp represents a state of the hybrid logical clock.
 message Timestamp {
   option (gogoproto.goproto_stringer) = false;
+  option (gogoproto.unmarshaler) = true;
 
   // Holds a wall time, typically a unix epoch time
   // expressed in nanoseconds.
@@ -40,6 +43,8 @@ message Timestamp {
 // basic types: a "bag o' bytes" generic byte slice and an incrementable
 // int64, for use with the Increment API call.
 message Value {
+  option (gogoproto.unmarshaler) = true;
+
   // Bytes is the byte slice value. If this field is set, the integer field
   // should not be.
   optional bytes bytes = 1;
@@ -65,6 +70,8 @@ message Value {
 // MVCCValue differentiates between normal versioned values and
 // deletion tombstones.
 message MVCCValue {
+  option (gogoproto.unmarshaler) = true;
+
   // True to indicate a deletion tombstone. If false, value should not
   // be nil.
   optional bool deleted = 1 [(gogoproto.nullable) = false];
@@ -115,6 +122,31 @@ message MergeTrigger {
   optional int64 subsumed_raft_id = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "SubsumedRaftID"];
 }
 
+// ReplicaChangeType is a parameter of ChangeReplicasTrigger.
+enum ReplicaChangeType {
+  option (gogoproto.goproto_enum_prefix) = false;
+  ADD_REPLICA = 0;
+  REMOVE_REPLICA = 1;
+}
+
+message ChangeReplicasTrigger {
+  optional int32 node_id = 1 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "NodeID", (gogoproto.customtype) = "NodeID"];
+  optional int32 store_id = 2 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "StoreID", (gogoproto.customtype) = "StoreID"];
+  optional ReplicaChangeType change_type = 3 [(gogoproto.nullable) = false];
+
+  // The new replica list with this change applied.
+  repeated Replica updated_replicas = 4 [(gogoproto.nullable) = false];
+}
+
+// CommitTrigger encapsulates all of the internal-only commit triggers.
+message InternalCommitTrigger {
+  optional SplitTrigger split_trigger = 1;
+  optional MergeTrigger merge_trigger = 2;
+  optional ChangeReplicasTrigger change_replicas_trigger = 3;
+}
+
 // IsolationType TODO(jiajia) Needs documentation.
 enum IsolationType {
   option (gogoproto.goproto_enum_prefix) = false;
@@ -148,6 +180,8 @@ enum TransactionStatus {
 // NodeList keeps a growing set of NodeIDs as a sorted slice, with Add()
 // adding to the set and Contains() verifying membership.
 message NodeList {
+  option (gogoproto.unmarshaler) = true;
+
   // Note that this does not use the NodeID custom type because that appears
   // to interact badly with the repeated and/or packed options.
   repeated int32 nodes = 1 [packed=true];
@@ -161,6 +195,7 @@ message NodeList {
 // contention.
 message Transaction {
   option (gogoproto.goproto_stringer) = false;
+  option (gogoproto.unmarshaler) = true;
 
   optional string name = 1 [(gogoproto.nullable) = false];
   // Key is the key which anchors the transaction. This is typically
@@ -214,6 +249,8 @@ message Transaction {
 
 // MVCCMetadata holds MVCC metadata for a key. Used by storage/engine/mvcc.go.
 message MVCCMetadata {
+  option (gogoproto.unmarshaler) = true;
+
   optional Transaction txn = 1;
   // The timestamp of the most recent versioned value.
   optional Timestamp timestamp = 2 [(gogoproto.nullable) = false];
@@ -231,10 +268,12 @@ message MVCCMetadata {
   optional Value value = 6;
 }
 
-// ScanMetadata holds information about last complete key/value scan
-// of a range.
-message ScanMetadata {
-  // The last scan timestamp in nanoseconds since the Unix epoch.
+// GCMetadata holds information about the last complete key/value
+// garbage collection scan of a range.
+message GCMetadata {
+  option (gogoproto.unmarshaler) = true;
+
+  // The last GC scan timestamp in nanoseconds since the Unix epoch.
   optional int64 last_scan_nanos = 1 [(gogoproto.nullable) = false];
   // The oldest unresolved write intent in nanoseconds since epoch.
   // Null if there are no unresolved write intents.
@@ -244,15 +283,17 @@ message ScanMetadata {
 // TimeSeriesDatapoint is a single point of time series data; a value associated
 // with a timestamp.
 message TimeSeriesDatapoint {
-    // The timestamp when this datapoint is located, expressed in nanoseconds
-    // since the unix epoch.
-    optional int64 timestamp_nanos = 1 [(gogoproto.nullable) = false];
-    // An integer representation of the value of this datapoint. If this field
-    // is set, then 'float_value' must not be set.
-    optional int64 int_value = 2;
-    // A floating point representation of the value of this datapoint. If this
-    // field is set, then 'int_value' must not be set.
-    optional float float_value = 3;
+  option (gogoproto.unmarshaler) = true;
+
+  // The timestamp when this datapoint is located, expressed in nanoseconds
+  // since the unix epoch.
+  optional int64 timestamp_nanos = 1 [(gogoproto.nullable) = false];
+  // An integer representation of the value of this datapoint. If this field
+  // is set, then 'float_value' must not be set.
+  optional int64 int_value = 2;
+  // A floating point representation of the value of this datapoint. If this
+  // field is set, then 'int_value' must not be set.
+  optional float float_value = 3;
 }
 
 // TimeSeriesData is a set of observations of a single variable value at
@@ -260,9 +301,11 @@ message TimeSeriesDatapoint {
 // identifies the source variable, and a repeated set of TimeSeriesDatapoint
 // messages representing distinct measurements of that variable.
 message TimeSeriesData {
-    // A string which uniquely identifies the variable from which this data was
-    // measured.
-    optional string name = 1 [(gogoproto.nullable) = false];
-    // Datapoints representing one or more measurements taken from the variable.
-    repeated TimeSeriesDatapoint datapoints = 2;
+  option (gogoproto.unmarshaler) = true;
+
+  // A string which uniquely identifies the variable from which this data was
+  // measured.
+  optional string name = 1 [(gogoproto.nullable) = false];
+  // Datapoints representing one or more measurements taken from the variable.
+  repeated TimeSeriesDatapoint datapoints = 2;
 }
